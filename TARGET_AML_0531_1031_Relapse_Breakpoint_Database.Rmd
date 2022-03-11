@@ -1,0 +1,1020 @@
+---
+title: 'Fusion Breakpoint Database from RNAseq'
+author: "Jenny Smith"
+date:"Jan. 12, 2021"
+output: html_document
+---
+
+#Set-up 
+
+```{r setup}
+library(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME, '/2018.09.11_Combine_Fusion_Calls/'))
+
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8)
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(furrr)
+
+library(DeGSEA)
+library(fusBreakpoint)
+getwd()
+```
+
+
+#Read in the Clinical Data
+
+```{r}
+CDE.merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_05.21.21.csv"),
+                       na.strings = c("#N/A","N/A", "^$", "\\.", "NA"))
+
+CDE.merged <- CDE.merged %>% 
+  filter(!is.na(USI), 
+         !grepl("Unknown", USI))
+
+head(CDE.merged[,1:5])
+dim(CDE.merged)
+```
+
+```{r}
+manifest <- read.csv(file.path(TARGET,"SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_08.12.21.csv")) 
+  
+dim(manifest) 
+```
+
+# Read in the Trancript/Gene IDs
+
+```{r}
+refseq <- read.csv("Fusion_Reference/defaultIsoform.human.txt", sep="\t", header = FALSE)
+
+dim(refseq)
+head(refseq)
+```
+
+
+# Fusion Data 
+
+```{r}
+dbs <- readRDS("Fusion_Reference/Fusion_ReferenceFiles_10.8.18.RDS")
+
+sapply(dbs, dim)
+```
+
+```{r}
+#There is some wrong with this file...
+#its missing ISCN data for a lot of patients with it in the CDEs????
+fusions <- read.csv("Combined_withConfidence_Levels/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_FusionCalls_withConfidenceLevels_Annotated_01.25.21.csv")
+
+
+dim(fusions)
+head(fusions[,1:5])
+length(unique(fusions$Patient)) #2313
+```
+
+
+```{r}
+fusions.dx <- fusions %>% 
+  dplyr::filter(Time_point == "diagnostic" & Group=="AML")
+
+dim(fusions.dx) #161062    169
+
+length(unique(fusions.dx$Patient)) #1672
+length(unique(fusions.dx$USI)) #1574
+# sum(grepl("_replicate", unique(fusions.dx$Patient)))  #53 replicates
+# table(unique(fusions.dx$USI) %in% CDE.merged$USI) #OK all in CDEs
+```
+
+```{r}
+fusions.rlps <- fusions %>% 
+  dplyr::filter(c(Time_point == "relapse" & Group=="AML") | Group=="FlowSorted")
+
+dim(fusions.rlps) #20958   169
+
+length(unique(fusions.rlps$Patient)) #504
+length(unique(fusions.rlps$USI)) #436 samples
+# sum(grepl("_replicate", unique(fusions.rlps$Patient)))  #18 replicates
+# table(unique(fusions.rlps$USI) %in% CDE.merged$USI) #OK all in CDEs
+```
+
+
+# Define Samples 
+
+```{r}
+primary.fusions.perPatient <- CDE.merged %>% 
+  dplyr::filter(USI %in% fusions.dx$USI | USI %in% fusions.rlps$USI) %>% 
+  dplyr::filter(!grepl("^No\\.|^None$", Primary.Fusion)) %>% 
+  dplyr::filter(!grepl("ETV6 .deletion.|Inv.16.\\?|^MECOM$", Primary.Fusion)) %>% 
+  
+  #Clean up the primary fusionss
+  mutate_at(vars(Primary.Fusion), ~gsub(" \\(deletion\\)","", .)) %>% 
+  mutate_at(vars(Primary.Fusion), ~case_when(
+    USI=="PAXXUZ" ~ "RUNX1-CBFA2T2",
+    TRUE ~ gsub(" {1,}","", .))) %>% 
+  
+  dplyr::select(USI,Protocol, Primary.Fusion, Cyto_vs_Seq_Fusions, Primary.CNV, ISCN) %>% 
+  arrange(Primary.Fusion)
+
+
+dim(primary.fusions.perPatient) #1166    6
+head(primary.fusions.perPatient)
+
+#1,166 are in the fusions data. 
+# any(duplicated(primary.fusions.perPatient$USI))
+
+# table(unique(fusions.dx$USI) %in% primary.fusions.perPatient$USI) #439 have None/No Primary Fusion Called even with the RNAseq data. Maybe worth looking at these samples again... 
+```
+
+```{r}
+#About ~137 unique gene-fusion pairs
+primary.fusions.perPatient %>%
+  group_by(Primary.Fusion) %>%
+  summarize(N=n()) %>%
+  arrange(desc(N)) %>% 
+  dplyr::filter(!grepl("-X", Primary.Fusion)) %>%   #these fusions have unknown partners and are typicall cyto only
+  head(., n=10)
+```
+
+
+# Genomic References
+
+```{r}
+IDmap <- read.csv(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/GeneSymbol_Ensembl_ID_Conversion_GRCh37.69_FromBCCA.csv"))
+
+# head(IDmap)
+```
+
+```{r message=FALSE}
+Grch37.txdb <- AnnotationDbi::loadDb("GRCh37-lite_Ensembl_v69_TxDB.sqlite")
+Grch37.txdb
+```
+
+```{r}
+Grch37.lite <- file.path(GENREFS,"GRCh37/fasta/genome/Grch37-lite/GRCh37-lite.fa")
+
+seqlens <- read.delim("Grch37.lite_chrom_lengths.txt") %>% 
+  rownames_to_column("chr") %>%
+  pull(x, name=chr)
+
+# seqlens <- BSgenome::fasta.seqlengths(Grch37.lite)
+# write.table(seqlens,"Grch37.lite_chrom_lengths.txt",sep="\t",quote = F)
+# head(seqlens)
+```
+
+# Reformat the Fusion Data for RBD Cohort
+
+```{r}
+primary.fusions <- read.csv("Fusion_Breakpoints_Summary/00_Archive/TARGET_AML_Primary.Fusions_Raw_Data_Subset.csv")
+
+# dim(primary.fusions) #1190  169
+head(primary.fusions)
+```
+
+```{r message=FALSE, eval=FALSE}
+#1:nrow(primary.fusions.perPatient)
+primary.fusions <- lapply(1:nrow(primary.fusions.perPatient), function(n){
+  
+  df <- primary.fusions.perPatient %>% 
+    dplyr::slice(n)
+  
+  # print(df)
+  
+  fus.regex <- pull(df, Primary.Fusion) %>%
+    str_split(., "-") %>%
+    unlist() %>% 
+    c(paste(.[1], .[2], sep="-"), paste(.[2], .[1], sep="-")) %>% 
+    .[grep("-", .)] %>% 
+    paste0("^",., "$") %>% 
+    paste(., collapse="|")
+  
+  # print(fus.regex)
+  
+  primary.fusion.data <- fusions.dx %>%
+    dplyr::filter(grepl(df[["USI"]], Patient)) %>%
+    dplyr::filter(grepl(fus.regex, Fusion.Category))
+  
+  #rescue who can be from the relapse samples breakpoints
+  if(nrow(primary.fusion.data) == 0){
+   primary.fusion.data <- fusions.rlps %>% 
+    dplyr::filter(grepl(df[["USI"]], Patient)) %>%
+    dplyr::filter(grepl(fus.regex, Fusion.Category))
+  }
+  
+  # print(dim(primary.fusion.data))
+  return(primary.fusion.data)
+  
+})  %>% 
+  bind_rows()
+
+
+dim(primary.fusions) #1190  169
+# head(primary.fusions)
+
+any(duplicated(primary.fusions$Patient))
+length(unique(primary.fusions$USI)) 
+
+# write.csv(primary.fusions, "Fusion_Breakpoints_Summary/TARGET_AML_Primary.Fusions_Raw_Data_Subset.csv", row.names = F)
+```
+
+
+
+# Patients Missing RNAseq Evidence
+
+```{r}
+missingPts <- primary.fusions.perPatient %>% 
+  dplyr::filter(!USI %in% primary.fusions$USI) 
+
+
+missingPts %>% 
+  group_by(Cyto_vs_Seq_Fusions) %>% 
+  summarize(N=n())
+
+dim(missingPts) #67  6
+# head(missingPts)
+
+shouldHaveRNAseq <- dplyr::filter(missingPts,
+                                  grepl("both confirms|RNA [sS]eq only|Unknown", Cyto_vs_Seq_Fusions)) %>% 
+  mutate(inRBD_or_DiscoverySet=ifelse(USI %in% fusions$USI,"Yes", "No")) %>% 
+  arrange(Cyto_vs_Seq_Fusions)
+
+
+dim(shouldHaveRNAseq) #18 
+```
+
+```{r}
+toUpdateEvidence <- filter(CDE.merged, 
+       Cyto.vs..Seq=="Unknown") %>% 
+  dplyr::select(USI, Protocol,Primary.Fusion, Cyto.vs..Seq, ISCN) %>% 
+  mutate(HasRNAseqEvidence_ofPrimaryFusion=ifelse(USI %in% primary.fusions$USI, "Yes", "No"), 
+         Has.RBD.Seq=ifelse(USI %in% manifest$USI | USI=="S.1327","Yes","No")) %>% 
+  arrange(desc(HasRNAseqEvidence_ofPrimaryFusion),Primary.Fusion) 
+  # filter(HasRNAseqEvidence_ofPrimaryFusion=="No")
+
+toUpdateEvidence
+table(CDE.merged$Cyto.vs..Seq)
+# write.csv(toUpdateEvidence, file.path(CDE,"Merged/TARGET_AML_Cyto.vs..Seq_Updates_v2.csv"), row.names = F)
+```
+
+```{r}
+#Visually check each one 
+#only found 2 samples that were missed due to type-o's
+#All others should simply be "cyto only"
+
+lapply(pull(shouldHaveRNAseq, USI), function(usi){# 
+  fusions %>%
+    dplyr::select(-ISCN) %>%
+    left_join(., dplyr::filter(shouldHaveRNAseq, USI==usi),
+              by="USI") %>%
+    dplyr::filter(USI==usi) %>%
+    dplyr::select(Patient,Lib_Prep,Primary.Fusion,Cyto.vs..Seq,
+                  ISCN,breakpoint_comparison, All_Fusions_Called:FusionName.TargAlign) 
+}) 
+
+```
+
+
+ZNF292-PNRC1 could be real??
+- https://ash.confex.com/ash/2020/webprogram/Paper141166.html  (ALL)
+- https://journals.lww.com/hemasphere/Abstract/2019/06001/PS1004_PTC299_IS_A_NOVEL_DHODH_INHIBITOR_FOR_USE.894.aspx (pediatric AML)
+
+
+
+PARDDY - KMT2A-MLLT4 not in RNA-seq fusions or in ISCN
+PANWYJ - should be cyto only and KMT2A-MLLT4 (labeled AFDN now) for consistency
+PASPYR - both confirms but only in relapse sample
+PAXXCX - both confirms but only in relapse sample
+PASPRK - both confirms but only in relapse sample
+PATKYT - should be cyto only
+PARUNX - should be cyto only
+PASSSI - should be cyto only
+PANZKA - should by cyto only
+PANYSN - should be cyto only
+PASIEE - should be cyto only
+PASIZB - should be cyto only
+PATHPT - should be cyto only 
+PABZKY - should be cyto only
+PAEEXH - should be cyto only
+PASEMA - should by cyto only 
+PARXFZ - should by cyto only
+PARYCU - should by cyto only
+
+# Breakpoints Long Format 
+
+```{r}
+primary.fusions <- read.csv("Fusion_Breakpoints_Summary/TARGET_AML_Primary.Fusions_Raw_Data_Subset.csv")
+
+# primary.fusions
+# dim(primary.fusions)
+```
+
+```{r}
+primary.fusion.brks <- primary.fusions %>%
+  mutate(GeneA=str_split_fixed(Fusion.Category, pattern = "-", n=2)[,1],
+         GeneB=str_split_fixed(Fusion.Category, pattern = "-", n=2)[,2]) %>% 
+  #reorder 
+  dplyr::select(Sample=Patient,
+         Fusion.Category, 
+         GeneA,
+         GeneB,
+         breakpoint_comparison,
+         breakpoint.TA,Breakpoints.STAR,Breakpoint.CICERO, 
+         everything()) %>% 
+  arrange(Sample)
+
+# primary.fusion.brks
+
+# table(duplicated(primary.fusion.brks$Sample)) #FALSE
+# table(duplicated(primary.fusion.brks$USI)) 
+```
+
+```{r}
+primary.breakpoints <- primary.fusion.brks %>% 
+  dplyr::select(Sample,
+                 Fusion.Category,
+                 breakpoint_comparison,
+                 Fusion.TA, 
+                 X.Fusion.STAR, 
+                 Fusion.Category.CICERO,
+                 breakpoint.TA,
+                 Breakpoints.STAR,
+                 Breakpoint.CICERO) %>% 
+  
+  #Gather into long format
+  pivot_longer(cols=Fusion.TA:Breakpoint.CICERO,
+               names_to="Algorithm",
+               values_to="Value") %>% 
+  mutate(Group=case_when(
+    grepl("Fusion.TA|X.Fusion.STAR|Fusion.Category.CICERO", Algorithm) ~ "Fusion_Name", 
+    TRUE ~ "Breakpoint")) %>% 
+  filter(!is.na(Value)) %>% 
+  #Create 2 columns - one for the original fusion name (Fusion_Name) per algorithm, and the original Breakpoint per algorithm
+  mutate_at(vars(Algorithm), ~gsub("^.+\\.(TA|STAR|CICERO)$", "\\1", .)) %>% 
+  pivot_wider(id_cols=c(Sample,Fusion.Category,breakpoint_comparison, Algorithm),
+              names_from=Group,
+              values_from=Value) %>% 
+  
+  #select one breakpoint per patient, using the breakpoints with strongest evidence across 3 fusion callers
+  group_by(Sample) %>%
+  mutate(keep=case_when(
+   n() == 1 ~ TRUE, #only TA, only STAR, and only CICERO calls. Just keep as is out of necessing
+   
+   #Highest confidence breakpoint positions. 
+   n() > 1 & all(breakpoint_comparison == "all_identical_breakpoints") & 
+     any(grepl("STAR", Algorithm)) ~ ifelse(grepl("STAR", Algorithm), TRUE, FALSE), 
+   n() > 1 & all(breakpoint_comparison == "all_identical_breakpoints") & 
+     any(grepl("CICERO", Algorithm)) ~ ifelse(grepl("CICERO", Algorithm), TRUE, FALSE),
+   n() > 1 & all(breakpoint_comparison == "all_identical_breakpoints") & 
+     any(grepl("TA", Algorithm)) ~ ifelse(grepl("TA", Algorithm), TRUE, FALSE),
+   
+   # Keep fusion breakpoint with at least 2 callers support  
+   n() > 1 &  all(grepl("TAxSTAR: identical|STARxCICERO: identical",breakpoint_comparison)) & 
+     any(grepl("STAR", Algorithm)) ~ ifelse(grepl("STAR", Algorithm), TRUE, FALSE),
+   n() > 1 & all(grepl("TAxCICERO: identical",breakpoint_comparison)) & 
+     any(grepl("CICERO", Algorithm)) ~ ifelse(grepl("CICERO", Algorithm), TRUE, FALSE),
+   
+   #Keep the one with at least +/- 5bp tolerance from STAR or CICERO since they are more modern.
+   n() > 1 & all(grepl("STARxCICERO: .+5bp_matched_breakpoints|TAxSTAR: .+5bp_matched_breakpoints",breakpoint_comparison)) & 
+     any(grepl("STAR", Algorithm)) ~ ifelse(grepl("STAR", Algorithm), TRUE, FALSE),
+   n() > 1 & all(grepl("TAxCICERO: .+5bp_matched_breakpoints",breakpoint_comparison)) & 
+     any(grepl("CICERO", Algorithm)) ~ ifelse(grepl("CICERO", Algorithm), TRUE, FALSE),
+   
+   #Each algorithm found the same breakpoints, but each one assigned different "strenght of read evidence" to each 
+   #so no shared "Primary Breakpoints"with the highest read evidence. 
+   n() > 1 & all(grepl("TAxSTAR: both_in_alternate_breakpoints|STARxCICERO: different_breakpoints",breakpoint_comparison)) & 
+     any(grepl("STAR", Algorithm)) ~ ifelse(grepl("STAR", Algorithm), TRUE, FALSE),
+   
+   # Conflicting evidence is difficult to decide - so just take STAR since its a more modern algorithm. 
+   n() > 1 & all(breakpoint_comparison == "TAxSTAR: different_breakpoints") & 
+     any(grepl("STAR", Algorithm)) ~ ifelse(grepl("STAR", Algorithm), TRUE, FALSE),
+   n() > 1 & all(breakpoint_comparison == "STARxCICERO: different_breakpoints") & 
+     any(grepl("STAR", Algorithm)) ~ ifelse(grepl("STAR", Algorithm), TRUE, FALSE)
+   )) %>% 
+  
+  #Will need to add a long and involved way to keep the original fusion name from the algorith (eg X.Fusion.STAR, Fusion.CICERO, etc.)
+  
+  ungroup() %>% 
+  dplyr::filter(keep) %>%
+
+  #Order breakpoints by Chr to avoid miscounting
+  rowwise() %>%
+  mutate(Breakpoint_Order=order_breakpoints(Breakpoint)) %>%
+  ungroup()
+
+
+dim(primary.breakpoints)
+any(duplicated(primary.breakpoints$Sample))
+# write.csv(primary.breakpoints,"Fusion_Breakpoints_Summary/TARGET_AML_diagnostic_primary_breakpoints_per_patient_10.5.2021.csv", row.names = FALSE)
+```
+
+```{r}
+# table(primary.breakpoints$breakpoint_comparison)
+table(grepl("identical", primary.breakpoints$breakpoint_comparison)) #885 (74.4%) with >= 2 fusion callers evidence
+table(grepl("alternate", primary.breakpoints$breakpoint_comparison) & !grepl("identical", primary.breakpoints$breakpoint_comparison)) #63 (cumulative 79.7% breakpoints with higher confidence)
+table(grepl("Only", primary.breakpoints$breakpoint_comparison)) #200 (17%) singletons
+#So ~5% were kinda a judgement call to keep STAR as the base reference where possible or keep the singleton. 
+```
+
+```{r}
+# For Paul Baldock and Guy Barry
+primary.breakpoints %>%
+  filter(Fusion_Name=="CBFA2T3-GLIS2") %>%
+  dplyr::select(Fusion_Name, Breakpoint) %>%
+  mutate(Total=n()) %>% 
+  group_by(Fusion_Name, Breakpoint) %>% 
+  mutate(Frequency=round((n()/Total)*100, digits=2)) %>% 
+  ungroup() %>% 
+  distinct() #%>%
+  # write.csv(.,"~/CBFA2T3-GLIS2_RNA-seq_Breakpoints.csv", row.names = FALSE)
+```
+
+
+# Breakpoints Summary by Genomic Position
+
+
+## TO DO 
+
+I need to look at the translated fusion sequence! Since the reciprocals can be difficule to determine who is 5' and 3'
+so for example, a NSD1-NUP98 fusion has the most evidence, can the same breakpoints but a reciprocal of NUP98-NSD1 still make an in-frame fusion?
+
+1. get genomic TSS to Breakpoint gene A
+2. get genomic breakpoint gene B to TTS
+3. map genomic sequences to CDS for gene A/B
+4. translate the concatentated sequnce 
+5. reverce the process for gene B to gene A orientation 
+
+```{r}
+FOI.pair <- read.csv("Fusion_Reference/Fusions_of_Interest.csv", header = FALSE) %>%
+  unique()  %>% 
+  dplyr::filter(!grepl("MLLT10-KMT2A", V1)) #Want these to be KMT2A-MLLT10 nomenclature 
+
+# View(FOI.pair)
+# head(FOI.pair)
+# dim(FOI.pair)
+```
+
+```{r eval=FALSE}
+summary_GenomicPos <- primary.breakpoints %>% 
+  
+  # Denote which of the breakpoints are unique, but retain the original breakpoint provided from the fusion caller 
+  group_by(Fusion.Category) %>% 
+  mutate(Breakpoint_Groups=as.numeric(as.factor(Breakpoint_Order))) %>% 
+  ungroup() %>% 
+  
+  #collapse the fusion caller evidence comparisons
+  group_by(Fusion.Category, Breakpoint_Groups) %>% 
+  mutate(Evidences=paste(unique(breakpoint_comparison), collapse="; "))
+  # mutate(Algorithms=paste(unique(Algorithm), collapse=";")) %>% 
+  mutate(Number_Breakpoint_Seen_Per_FusionType=n()) %>% 
+  ungroup() 
+  
+  #Select unique breakpoint locations per fusion-pair
+  dplyr::select(
+                # Algorithm:Breakpoint,
+                Fusion.Category,
+                Breakpoint_Order,Evidences,
+                Number_Breakpoint_Seen_Per_FusionType) %>%
+  distinct()
+
+  #Create larger groupings for the main fusions in AML
+  mutate(Fusion.Group=case_when(
+    grepl("KMT2A", Fusion.Category) ~ "KMT2A",
+    grepl("NUP98", Fusion.Category) ~ "NUP98",
+    grepl("CBFB-MYH11", Fusion.Category) ~ "CBFB-MYH11",
+    grepl("RUNX1-RUNX1T1", Fusion.Category) ~ "RUNX1-RUNX1T1",
+    TRUE ~ "Other"),
+    GeneA=str_split_fixed(Fusion.Category,"-",n=2)[,1],
+    GeneB=str_split_fixed(Fusion.Category,"-",n=2)[,2]) %>%
+
+  mutate(Fusion_Reciprocal=paste(GeneB, GeneA, sep="-")) %>%
+  #Fix standard fusion names here.
+  mutate(Fusion=case_when(
+    grepl("^KMT2A|^NUP98|^ETV6|^ERG|^FLI1|^FUS|^KAT6A|^MLLT10-[^K]|^MECOM|^DEK|^RBM15|^RUNX1", Fusion.Category) ~ Fusion.Category,
+    grepl("^KMT2A|^NUP98|^ETV6|^ERG|^FLI1|^FUS|^KAT6A|^MLLT10-[^K]|^MECOM|^DEK|^RBM15|^RUNX1", Fusion_Reciprocal) ~ Fusion_Reciprocal,
+    TRUE ~ Fusion.Category)) %>%
+
+  #remove "." since the official gene symbol is either a hypthen or no-seperator
+  mutate_all(~gsub("PALM2.AKAP2", "PALM2AKAP2", .)) %>%
+  mutate_at(vars(Number_Breakpoint_Seen_Per_FusionType), ~as.numeric(.)) %>%
+  dplyr::select(Fusion,Fusion.Group,
+                Number_Breakpoint_Seen_Per_FusionType,
+                GeneA, GeneB,
+                -Fusion.Category,
+                everything(),
+                Fusion.Category,
+                Fusion_Reciprocal) %>%
+  arrange(Fusion.Group, Fusion.Category, desc(Number_Breakpoint_Seen_Per_FusionType))
+
+
+summary_GenomicPos
+# head(summary_GenomicPos)
+# dim(summary_GenomicPos) #264 genomic breakpoints 
+# table(summary_GenomicPos$Fusion.Group)
+# write.csv(summary_GenomicPos, "Fusion_Breakpoints_Summary/TARGET_AML_0531_1031_DiscoverySet_Diagnostic_Breakpoints_GenomicPos_Summary_1.25.20.csv", row.names = F)
+```
+
+```{r}
+allFusions <- unique(primary.fusions.perPatient$Primary.Fusion)
+allFusions <- allFusions[!grepl("-X",allFusions)]
+length(allFusions)
+
+regex <- summary_GenomicPos %>% 
+  dplyr::select(Fusion.Category,Fusion_Reciprocal) %>% 
+  distinct() %>% 
+  unite(col = New, Fusion.Category, Fusion_Reciprocal, sep="|") %>% 
+  pull(New) %>% 
+  paste(., collapse = "|")
+
+grep(regex, allFusions, value=T, invert = T) 
+
+#KMT2A-PALM2.AKAP2 OK. it  was simply renamed KMT2A-PALM2AKAP2
+#Yes checked these - it appears that most are cyto-only and others I cannot find in the fusion call file. 
+#The others with -X indicate that they have unknown partners and are typically from cytogenetics
+# primary.fusions.perPatient %>%
+#   dplyr::filter(grepl("ETV6-CCND3|KMT2A-ACTN4|KMT2A-AFDN|KMT2A-CCNJL|KMT2A-RARA", Primary.Fusion))
+```
+
+```{r}
+fusion.genes <- summary_GenomicPos %>% 
+  dplyr::select(GeneA,GeneB)  %>% 
+  unlist() %>%
+  unique()
+  
+head(fusion.genes)
+length(fusion.genes) #143
+```
+
+
+
+# Fusion Transcript GRanges
+
+```{r}
+library(biomaRt)
+mart.37 <- useEnsembl(biomart = "ENSEMBL_MART_ENSEMBL",
+                          dataset = "hsapiens_gene_ensembl",
+                          GRCh = 37) 
+
+# mart.37
+```
+
+```{r}
+inRefseq <- refseq %>% 
+  #Manually update the gene names to avoid any major misclassifications that can happen `en masse` with alias mapping. 
+  mutate_at(vars(V1), ~case_when(
+    .=="MYST2" ~ "KAT7",
+    .=="MLL3" ~ "KMT2C",
+    .=="MRTFA" ~ "MKL1",
+    .=="AFDN" ~ "MLLT4",
+    .=="SEPTIN2" ~ "SEPT2",
+    .=="SEPTIN6" ~ "SEPT6",
+    .=="SEPTIN9" ~ "SEPT9",
+    .=="ALS2CR4" ~ "TMEM237",
+    TRUE ~ .)) %>% 
+  
+  #So the refSeq transcript variant 1 NM_004349 is almost 35-40 Kbp shorter than transcript variant 2 NM_175634, 
+  #this is causing an issue for RUNX1-RUNX1T1 patients whose fusoin mapped upstream of NM_004349! 
+  #So is C9orf72 NM_145005 -- too short! same for the rest of  genes
+  mutate_at(vars(V2), ~case_when(
+    .=="NM_004349" ~ "NM_175634", #RUNX1T1
+    .=="NM_145005" ~ "NM_001256054", #C9orf72
+    .=="NM_001105077" ~ "NM_004991", #MECOM,
+    .=="NM_152263" ~ "NM_153649", #TPM3 - check if NM in GRCh37 
+    .=="NM_021144" ~ "NM_033222",  #PSIP1
+    .=="NM_206927" ~ "NM_032943", #SYTL2
+    TRUE ~ .)) %>% 
+  #Needed to add a couple rows. 
+  add_row(V1="LINC00478", V2="NR_027790") %>% 
+  add_row(V1="PALM2AKAP2",V2="NM_147150") %>% 
+  dplyr::filter(V1 %in% fusion.genes)
+
+
+dim(inRefseq)
+head(inRefseq)
+# setdiff(fusion.genes, inRefseq$V1)
+```
+
+```{r}
+# searchAttributes(mart.37, pattern="transcript_id")
+# searchAttributes(mart.37, pattern="RefSeq")
+# searchFilters(mart.37, pattern="RefSeq")
+
+attr.mart <-  c("ensembl_gene_id",
+                "external_gene_name", 
+                "ensembl_transcript_id",
+                "refseq_mrna", 
+                "refseq_ncrna")
+
+res.anno <- getBM(attributes = attr.mart,
+                       filters = c("refseq_mrna"),
+                       values = inRefseq$V2,
+                       mart = mart.37)
+
+res.anno.NC <- getBM(attributes = attr.mart,
+                       filters = c("refseq_ncrna"),
+                       values = "NR_027790",
+                       mart = mart.37)
+
+dim(res.anno.NC) #1
+dim(res.anno) #142
+```
+
+```{r}
+refSeq.Ens <- res.anno %>% 
+  arrange(external_gene_name) %>% 
+  bind_rows(res.anno.NC) %>% 
+  #yet again, more issues with the gene name alias...
+  mutate_at(vars(external_gene_name), ~case_when(
+    .=="JADE2" ~ "PHF15", 
+    .=="PALM2-AKAP2" ~ "PALM2AKAP2", 
+    TRUE ~ .)) %>% 
+  mutate_at(vars(refseq_mrna), ~case_when(
+    is.na(.) ~ refseq_ncrna,
+    TRUE ~ .)) 
+
+head(refSeq.Ens)
+# length(unique(res.anno$external_gene_name)) #142
+table(fusion.genes %in% refSeq.Ens$external_gene_name)
+# dim(refSeq.Ens)
+# any(duplicated(refSeq.Ens$external_gene_name)) #FALSE
+
+# write.csv(refSeq.Ens, "Fusion_Breakpoints_Summary/TARGET_AML_refSeq_ensembl_transcript_IDmap.csv", row.names = F)
+```
+
+So frustratingly, this transcript for DCP1A (ENST00000607628) is just NOT included in the TXDB object??? Though its very clearly in the GRCH37 reference, and its the ONLY DCP1A transcript  with a refseq accession at all. 
+
+select(Grch37.txdb, keys = "ENSG00000162290", 
+        keytype = c("GENEID"), 
+        columns = c("TXNAME","TXTYPE","GENEID"))
+
+```{r}
+exon.ranges <- exonsBy(Grch37.txdb, by="tx", use.names=TRUE)
+# head(exon.ranges)
+# head(names(exon.ranges))
+
+#Missing ENST00000607628
+table(refSeq.Ens$ensembl_transcript_id %in% names(exon.ranges))
+# refSeq.Ens[which(!refSeq.Ens$ensembl_transcript_id %in% names(exon.ranges)),]
+```
+
+well thankfully that EnsemblDB package came to the rescue. It has the correct transcript ID for DCP1A. 
+I just merged the Ensembl v69 results and these of v75  together. Perhaps not ideal, but its probably the most accurate at this moment. 
+
+```{r}
+library(EnsDb.Hsapiens.v75)
+edb <- EnsDb.Hsapiens.v75
+# edb #GRCh37 OK 
+
+exon.DCP1A <- exonsBy(edb, by="tx", use.names=TRUE)["ENST00000607628"]
+exon.DCP1A <- keepSeqlevels(exon.DCP1A, c(paste(1:22),"X","Y"))
+
+
+intron.ranges.DCP1A <- intronsByTranscript(edb, use.names=TRUE)["ENST00000607628"]
+intron.ranges.DCP1A <- keepSeqlevels(intron.ranges.DCP1A, c(paste(1:22),"X","Y"))
+intron.ranges.DCP1A <- mcol_intron_rank(intron.ranges.DCP1A)
+
+
+# head(exon.ranges2)
+# table(refSeq.Ens$ensembl_transcript_id %in% names(exon.ranges2)) #All found in this one... so perhaps something went wrong with the TXdb creation??
+```
+
+```{r}
+fusion.exon.ranges <- exon.ranges[intersect(refSeq.Ens$ensembl_transcript_id,
+                                            names(exon.ranges))]
+fusion.exon.ranges <- keepSeqlevels(fusion.exon.ranges, c(paste(1:22),"X","Y"))
+#identical(seqlevels(fusion.exon.ranges),seqlevels(exon.DCP1A)) #TRUE required
+fusion.exon.ranges <- c(fusion.exon.ranges, exon.DCP1A)
+# all(refSeq.Ens$ensembl_transcript_id %in% names(fusion.exon.ranges)) #TRUE
+fusion.exon.ranges <- fusion.exon.ranges[refSeq.Ens$ensembl_transcript_id]
+names(fusion.exon.ranges) <- refSeq.Ens$external_gene_name
+
+
+length(fusion.exon.ranges)
+head(fusion.exon.ranges)
+```
+
+```{r}
+fusion.intron.ranges <- intronsByTranscript(Grch37.txdb, use.names=TRUE)[intersect(refSeq.Ens$ensembl_transcript_id,
+                                            names(exon.ranges))]
+fusion.intron.ranges <- keepSeqlevels(fusion.intron.ranges, c(paste(1:22),"X","Y"))
+fusion.intron.ranges <- mcol_intron_rank(fusion.intron.ranges)
+fusion.intron.ranges <- c(fusion.intron.ranges, intron.ranges.DCP1A)
+
+
+# all(refSeq.Ens$ensembl_transcript_id %in% names(fusion.intron.ranges)) #TRUE
+fusion.intron.ranges <- fusion.intron.ranges[refSeq.Ens$ensembl_transcript_id]
+names(fusion.intron.ranges) <- refSeq.Ens$external_gene_name
+
+
+length(fusion.intron.ranges) 
+head(fusion.intron.ranges)
+```
+
+
+# Per Unique Genomic Breakpoint
+
+```{r}
+Exons_Per_GenomicPos <- summary_GenomicPos %>% 
+    separate(Breakpoint_Order, into=c("chromosomes_A",
+                              "pos_A",
+                              "chromosomes_B",
+                              "pos_B"), sep = "[:\\|]",
+           remove = F) %>%
+  arrange(Fusion.Group, Fusion.Category,desc(Number_Breakpoint_Seen_Per_FusionType)) %>% 
+  group_by(Fusion.Category) %>% 
+  mutate(Fusion_ID=paste(Fusion, 1:n(), sep="_")) %>% 
+  ungroup() %>% 
+  dplyr::select(Fusion_ID, everything(), -GeneA, -GeneB,-Fusion, -Fusion_Reciprocal)
+
+head(Exons_Per_GenomicPos)
+dim(Exons_Per_GenomicPos) # 264  10
+# View(Exons_Per_GenomicPos)
+# length(unique(Exons_Per_GenomicPos$Fusion_ID)) #OK
+```
+
+```{r}
+source(file.path(SCRIPTS, "RNAseq_Analysis/fusBreakpoint/R/exon_annotation_functions.R"))
+exon_junctions_summary <- purrr::map_dfr(pull(Exons_Per_GenomicPos, Fusion_ID), 
+                                function(i){
+                                   df <- dplyr::filter(Exons_Per_GenomicPos, Fusion_ID==i)
+                                   define_exon_junctions(df=df, 
+                                                         exon_ranges_GR=fusion.exon.ranges,
+                                                         intron_ranges_GR = fusion.intron.ranges)
+                                }) 
+
+
+
+dim(exon_junctions_summary) #264  32
+head(exon_junctions_summary)
+
+# write.csv(exon_junctions_summary, "Fusion_Breakpoints_Summary/TARGET_AML_exon_junctions_summary_temp.csv", row.names = F)
+```
+
+## TO DO
+
+I need a step here where after mapping the breakpoint, I check for reciprocals and evidence level. 
+I also need to trackdown how each fusion algorithm assigns 5' and 3' designation
+
+```{r}
+exon_junctions_summary <-  read.csv("Fusion_Breakpoints_Summary/00_Archive/TARGET_AML_exon_junctions_summary_temp.csv")
+
+dim(exon_junctions_summary)
+head(exon_junctions_summary)
+```
+
+```{r}
+#So fusion naming convention is pretty subjective in regards to the 5' partner or 3' partner. 
+#Also, fusion algorithms often find the reciprocals and these can have equal or greater read support per patient sample. 
+#So geneA/geneB is easier than trying to maintain strict 5' and 3' definitions and allows us to rename the fusions based on the most accepted nomenclature. 
+#Also I over-wrote the column Fusion in my exon mapping code. oh well. 
+exon_junctions_summary.toFix <- exon_junctions_summary %>% 
+  mutate(FIX=case_when(
+    Fusion %in% FOI.pair$V1 ~ FALSE,
+    grepl("^MYH11-CBFB$|^GLIS2-CBFA2T3$|^MLF1-NPM1$|^HOXB9-NIPBL$|^RARA-NPM1$", Fusion) ~ TRUE,
+    grepl("KMT2A$", Fusion) ~ TRUE,
+    grepl("NUP98$|ETV6$|ERG$|FLI1$|FUS$|KAT6A$|MECOM$|DEK$|RBM15$|RUNX1$|ALK$", Fusion) ~ TRUE,
+    TRUE ~  FALSE))
+
+
+exon_junctions_summary.fixed <- exon_junctions_summary.toFix %>%
+  dplyr::filter(FIX) %>%
+  dplyr::select(-Fusion,-Exons) %>%
+  rename_at(vars(matches("A$")), ~gsub("A$", "2", .)) %>%
+  rename_at(vars(matches("B$")), ~gsub("B$", "1", .)) %>%
+  rename_all(~gsub("1$","A", gsub("2$", "B", .))) %>%
+  mutate(Fusion=paste(geneA,geneB, sep="-"),
+         Exons=case_when(
+           !is.na(exon_rankA) & !is.na(exon_rankB) ~ paste(exon_rankA, exon_rankB, sep="_"),
+           !is.na(exon_rankA) & is.na(exon_rankB) ~ paste(exon_rankA, intron_rankB, sep="_"),
+           is.na(exon_rankA) & !is.na(exon_rankB) ~ paste(intron_rankA, exon_rankB, sep="_"),
+           is.na(exon_rankA) & is.na(exon_rankB) ~ paste(intron_rankA, intron_rankB, sep="_"))) 
+
+
+dim(exon_junctions_summary.fixed) #63 33
+table(exon_junctions_summary.toFix$FIX) #63 fusion names to fix
+# table(exon_junctions_summary.fixed$Exons)
+# table(exon_junctions_summary.fixed$Fusion)
+```
+
+```{r}
+#Fix the conventions for fusions....
+exon_junctions_summary.clean <- dplyr::filter(exon_junctions_summary.toFix, !FIX) %>% 
+  bind_rows(., exon_junctions_summary.fixed) %>% 
+  group_by(Fusion) %>% 
+  mutate(Number_Breakpoint_Seen_Per_FusionType=as.numeric(Number_Breakpoint_Seen_Per_FusionType),
+         Number_Samples_Queried_per_Fusion=sum(Number_Breakpoint_Seen_Per_FusionType)) %>% 
+  ungroup() %>% 
+  arrange(Fusion.Group,Fusion_ID) %>% 
+  dplyr::select(Fusion:Fusion.Group,
+                Number_Breakpoint_Seen_Per_Fusion=Number_Breakpoint_Seen_Per_FusionType, 
+                Number_Samples_Queried_per_Fusion,
+                everything()) %>% 
+  dplyr::select(Fusion,Fusion_ID,Fusion.Group,
+                Breakpoint_Order,
+                Number_Breakpoint_Seen_Per_Fusion,Number_Samples_Queried_per_Fusion, 
+                Exons, geneA, geneB, 
+                matches("A$"), matches("B$"), everything(), -FIX, -matches("seqname"))
+
+
+head(exon_junctions_summary.clean)
+dim(exon_junctions_summary.clean) #264  31
+
+# write.csv(exon_junctions_summary.clean, "Fusion_Breakpoints_Summary/TARGET_AML_0531_1031_DiscoverySet_Diagnostic_Breakpoints_GenomicPos_withExons_Summary_02.01.21.csv", row.names = F)
+```
+
+```{r}
+exon_junctions_summary.clean <- read.csv("Fusion_Breakpoints_Summary/TARGET_AML_0531_1031_DiscoverySet_Diagnostic_Breakpoints_GenomicPos_withExons_Summary_02.01.21.csv")
+
+head(exon_junctions_summary.clean)
+```
+
+```{r}
+exon_junctions_summary.CBFGLIS <- exon_junctions_summary.clean %>% 
+  filter(grepl("CBFA2T3-GLIS2", Fusion)) %>% 
+  select(Fusion, Total_Samples_Queried_per_Fusion,geneA, geneB, Exons)
+
+
+exon_junctions_summary.CBFGLIS
+```
+
+```{r}
+#How many unique breakpoint locations correspond to the same exon #s. 
+#Its actually not that much overlap - unique genomic breakpoints do often lead to unique exon combos \
+# exon_junctions_summary.clean %>% 
+#   group_by(Fusion,Exons) %>% 
+#   summarise(N=n())
+```
+
+```{r}
+#check fusion names to ensure convential 5' and 3' ordering (eg KMT2A-XXXX is maintained)
+# exon_junctions_summary.clean %>%
+#   pull(Fusion) %>%
+#   unique() %>%
+#   .[order(.)] %>% 
+#   View()
+```
+
+
+# Per Unique Patient Sample
+
+```{r}
+primary.exon.groups <- primary.breakpoints %>% 
+  separate(Breakpoint_Order, into=c("chromosomes_A",
+                              "pos_A",
+                              "chromosomes_B",
+                              "pos_B"), sep = "[:\\|]",
+           remove = F) 
+
+# dim(primary.exon.groups)
+# length(unique(primary.exon.groups$Sample))
+head(primary.exon.groups)
+```
+  
+
+```{r}
+#Build kept failing. once it finally built now the fucking function doesnt work, but it works if I souce the script. Just not use the function from the compiled R package. 
+
+#fuck the Fred Hutch intrafrastructure, fuck fucking Rstudio server that crashes all the fucking time. 
+#becaseu this is why I can't have nice fucking things - like a fucking R package even. 
+
+source(file.path(SCRIPTS, "RNAseq_Analysis/fusBreakpoint/R/exon_annotation_functions.R"))
+exon_junctions <- purrr::map_dfr(pull(primary.exon.groups, Sample), 
+                                function(i){
+                                   df <- dplyr::filter(primary.exon.groups, Sample==i)
+                                   define_exon_junctions(df=df, 
+                                                         exon_ranges_GR=fusion.exon.ranges,
+                                                         intron_ranges_GR = fusion.intron.ranges)
+                                }) 
+
+
+
+dim(exon_junctions) #1147   33
+head(exon_junctions)
+```
+
+```{r}
+#So fusion naming convention is pretty subjective in regards to the 5' partner or 3' partner. 
+#Also, fusion algorithms often find the reciprocals and these can have equal or greater read support per patient sample. 
+#So geneA/geneB is easier than trying to maintain strict 5' and 3' definitions and allows us to rename the fusions based on the most accepted nomenclature. 
+#Also I over-wrote the column Fusion in my exon mapping code. oh well. 
+exon_junctions.toFix <- exon_junctions %>% 
+  mutate(FIX=case_when(
+    Fusion %in% FOI.pair$V1 ~ FALSE,
+    grepl("^MYH11-CBFB$|^GLIS2-CBFA2T3$|^MLF1-NPM1$|^HOXB9-NIPBL$|^RARA-NPM1$", Fusion) ~ TRUE,
+    grepl("KMT2A$", Fusion) ~ TRUE,
+    grepl("NUP98$|ETV6$|ERG$|FLI1$|FUS$|KAT6A$|MECOM$|DEK$|RBM15$|RUNX1$|ALK$", Fusion) ~ TRUE,
+    TRUE ~  FALSE))
+
+
+exon_junctions.fixed <- exon_junctions.toFix %>%
+  dplyr::filter(FIX) %>%
+  dplyr::select(-Fusion,-Exons) %>%
+  rename_at(vars(matches("A$")), ~gsub("A$", "2", .)) %>%
+  rename_at(vars(matches("B$")), ~gsub("B$", "1", .)) %>%
+  rename_all(~gsub("1$","A", gsub("2$", "B", .))) %>%
+  mutate(Fusion=paste(geneA,geneB, sep="-"),
+         Exons=case_when(
+           !is.na(exon_rankA) & !is.na(exon_rankB) ~ paste(exon_rankA, exon_rankB, sep="_"),
+           !is.na(exon_rankA) & is.na(exon_rankB) ~ paste(exon_rankA, intron_rankB, sep="_"),
+           is.na(exon_rankA) & !is.na(exon_rankB) ~ paste(intron_rankA, exon_rankB, sep="_"),
+           is.na(exon_rankA) & is.na(exon_rankB) ~ paste(intron_rankA, intron_rankB, sep="_"))) 
+  # dplyr::select(matches("A$"), matches("B$")) 
+
+dim(exon_junctions.fixed) #343  34
+table(exon_junctions.toFix$FIX) #343 fusion names to fix
+# table(exon_junctions.fixed$Exons)
+# table(exon_junctions.fixed$Fusion)
+```
+
+```{r}
+#Fix the conventions for fusions....
+exon_junctions.clean <- dplyr::filter(exon_junctions.toFix, !FIX) %>% 
+  bind_rows(., exon_junctions.fixed) %>% 
+  
+  group_by(Fusion) %>% 
+  mutate(Number_Samples_per_Fusion=n()) %>% 
+  ungroup() %>% 
+  
+mutate(Fusion.Group=case_when(
+    grepl("KMT2A", Fusion.Category) ~ "KMT2A", 
+    grepl("NUP98", Fusion.Category) ~ "NUP98", 
+    grepl("CBFB-MYH11", Fusion.Category) ~ "CBFB-MYH11", 
+    grepl("RUNX1-RUNX1T1", Fusion.Category) ~ "RUNX1-RUNX1T1", 
+    TRUE ~ "Other")) %>% 
+  
+  arrange(Fusion.Group,Fusion,Exons) %>% 
+  dplyr::select(Sample, 
+                Fusion, Fusion.Group,
+                Breakpoint_Order,
+                Number_Samples_per_Fusion, 
+                Exons, geneA, geneB, 
+                matches("A$"), matches("B$"), everything(), -FIX, -matches("seqname"))
+
+
+head(exon_junctions.clean)
+dim(exon_junctions.clean) #264  31
+
+# write.csv(exon_junctions.clean, "Fusion_Breakpoints_Summary/TARGET_AML_0531_1031_DiscoverySet_Diagnostic_Breakpoints_GenomicPos_withExons_PerSample_02.01.21.csv", row.names = F)
+```
+
+### Add Clinical Data
+
+```{r}
+refSeq.Ens <-  read.csv("Fusion_Breakpoints_Summary/TARGET_AML_refSeq_ensembl_transcript_IDmap.csv") %>% 
+  select(-refseq_ncrna)
+
+head(refSeq.Ens)
+# any(is.na(refSeq.Ens$refseq_mrna))
+```
+
+```{r}
+exon_junctions.clean <- read.csv("Fusion_Breakpoints_Summary/TARGET_AML_0531_1031_DiscoverySet_Diagnostic_Breakpoints_GenomicPos_withExons_PerSample_02.01.21.csv") %>% 
+  mutate(USI=str_split_fixed(Sample,pattern = "\\.", n=5)[,3]) %>% 
+  select(Sample, USI, Fusion:Breakpoint_Order,Breakpoint,
+         Number_Samples_per_Fusion,
+         geneA,geneB,
+         Exons,
+         Exon_geneA=exon_rankA, 
+         Exon_geneB=exon_rankB,
+         Algorithm,
+         breakpoint_comparison) %>% 
+  left_join(.,rename_at(refSeq.Ens,
+                        vars(ensembl_gene_id,ensembl_transcript_id,refseq_mrna),
+                        ~paste0(., "_geneA")),
+            by=c("geneA"="external_gene_name")) %>% 
+  left_join(.,rename_at(refSeq.Ens,
+                        vars(ensembl_gene_id,ensembl_transcript_id,refseq_mrna),
+                        ~paste0(., "_geneB")),
+            by=c("geneB"="external_gene_name")) %>% 
+  left_join(., CDE.merged, 
+            by="USI") %>% 
+  select(-Breakpoint_Order)
+
+
+head(exon_junctions.clean)
+dim(exon_junctions.clean) #1147  169
+
+
+# write.csv(exon_junctions.clean, "Fusion_Breakpoints_Summary/TARGET_AML_0531_1031_DiscoverySet_Diagnostic_Breakpoints_GenomicPos_withExons_PerSample_CDEs_02.01.21.csv", row.names = FALSE)
+```
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+

@@ -1,0 +1,1644 @@
+---
+title: 'Fusion Cohort Selection from RNAseq'
+author: "Jenny Smith"
+date: "June 2020"
+output: html_document
+---
+
+#Set-up 
+
+```{r setup}
+library(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME, '/2018.09.11_Combine_Fusion_Calls/'))
+
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8)
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(furrr)
+getwd()
+```
+
+
+#Define Functions
+
+```{r}
+category <- function(g1,g2){
+  
+  f <- c(g1,g2)
+  
+  if(any(is.na(f))){
+    f <- f[!is.na(f)]
+  }else{
+    f <- f[order(f)]
+    f <- paste(f, collapse = "-")
+  }
+  
+  return(f)
+}
+```
+
+
+```{r}
+splitFusions <- function(FusionCol,regex, both=FALSE){
+  #FusionCol is the column name containing the semi-colon seperated values of fusions, patients as rows
+  #regex is the fusion of interest
+  #use with rowwise in dplyr 
+  
+  library(stringr)
+  
+  
+  fusions <- unlist(str_split(FusionCol, "; |, "))
+  fus <- unique(grep(regex, fusions, value = TRUE, ignore.case = TRUE))
+  
+  if(both){
+    genes <- unlist(str_split(regex, "\\|"))
+    g1.regex <- paste0("^", genes[1], "-", "|","-",genes[1], "$")
+    g2.regex <- paste0("^", genes[2], "-", "|","-",genes[2], "$")
+    
+    g1.present <- any(grepl(g1.regex, fusions))
+    g2.present <- any(grepl(g2.regex, fusions))
+    
+    if ( ! all(g1.present, g2.present)){
+      return("")
+    }
+  }
+  
+  
+  if (length(fus) < 1){
+    fus <- ""
+  }else if (length(fus) == 1){
+    fus <- fus
+  }else if (length(fus) > 1){
+    
+    #Order by alphabetical. 
+    fus <- str_split(fus, "-",simplify = FALSE) %>%
+      lapply(., function(x) x[order(x)])
+    
+    #Check for reciprocal fusions
+    test.reciprocal <- sapply(1:length(fus), function(x) identical(x=x,y=fus[1]))
+    
+    if(all(test.reciprocal)){
+      #if identical keep the first one. Reassemble to GeneA-GeneB notation. 
+      fus <- paste(fus[[1]],collapse = "-")
+      
+    }else{
+      #if there are more than 2 fusions, will check on later to make function more generalizable. Now, just collapse them. 
+      fus <- sapply(fus, function(y) paste(y, collapse = "-")) %>% 
+        paste(., collapse = "; ")
+    }
+  }
+  
+  
+  return(fus)
+}
+```
+
+
+
+```{r}
+#function to compare breakpoints with +/- 5bp padding between callers
+comp_brkpts <- function(Sample,Caller_Column, Breakpoints_Column){
+  callers <- Caller_Column
+  breakpoints <- set_names(Breakpoints_Column, callers)
+  primary <- breakpoints[!grepl("Alternate", names(breakpoints))]
+  alternate <- breakpoints[grepl("Alternate", names(breakpoints))]
+  
+  # print(Sample)
+   
+
+  #remove any breakpoints that NA (were not detected by another caller)
+  idx <- which(!is.na(primary))
+  callers <- callers[idx] %>% 
+    gsub("[Bb]reakpoints?\\.","",.)
+ 
+  #Check breakpoint for each caller 
+  num_callers <- length(idx)
+  if(any(grepl("None", primary))){
+    #samples for whom all fusions were filtered out or simply had none detected by the fusion algorithm. 
+    comp <- "None"
+    return(comp)
+    
+  }else if(num_callers == 0){
+    #since targeted alignment is no longer being used,
+    #then we need to include a catch all when brekapoints are all NAs
+    comp <- "Only_Detected_by_TargAlign"
+    return(comp)
+    
+  }else if(num_callers == 1){
+    comp <- paste0("Only_Detected_by_",callers)
+    return(comp)
+    
+  }else{
+   #split and sort the primary breakpoints for easier comparisons
+   primary <- primary[idx] %>% 
+      str_split(., pattern = "\\|") %>% 
+      lapply(., sort) %>% 
+      set_names(callers)
+  }
+  
+  #Of note, I should be able to figure out a way to make this dynamic, eg any number of fusion caller can be compared. 
+  #but im totally blanking on the combinations function that I need. 
+  if (num_callers==2){
+    c1 <- identical(primary[[1]], primary[[2]])
+    comparisons <-set_names(c1, c(paste(callers[1],callers[2],sep="x")))
+  
+  }else if (num_callers ==3){
+    c1 <- identical(primary[[1]], primary[[2]])
+    c2 <- identical(primary[[2]], primary[[3]])
+    c3 <- identical(primary[[1]], primary[[3]])
+  
+    comparisons <- set_names(c(c1,c2,c3),c(paste(callers[1],callers[2],sep="x"), 
+                                          paste(callers[2],callers[3],sep="x"),
+                                          paste(callers[1],callers[3],sep="x")))
+  }
+  
+  if(all(comparisons)){
+    comp <- "all_identical_breakpoints"
+    return(comp)
+    
+  }else{
+    
+    if(length(comparisons[comparisons]) >= 1){
+      ident <- paste0(names(comparisons[comparisons]), ": identical") 
+    }else{
+      ident <- NULL
+    }
+    
+    diff <- which(!comparisons)
+    results_of_alt_breakpoints <- NULL
+    results_of_bp_padding_comp <- NULL
+  
+    #search through each comparison +/- 5bp 
+    #and search for alternate breakpoints 
+    for(i in 1:length(diff)){
+      callers_to_check <- str_split(names(diff)[i],pattern="x")[[1]]
+        
+      #first check the alternate breakpoints, both for the fusion callers     
+      alt.idx <- which(!is.na(alternate))
+      alt_check <- NULL
+      if(length(alt.idx) >= 1){
+        #Define a list of alternate breakpoints to query
+        alt_list <- lapply(1:length(alt.idx), function(x) alternate[x]) %>% 
+              lapply(., function(x) str_split(x, pattern="; ")[[1]]) %>%
+              lapply(., function(x) str_split(x, pattern="\\|")) %>%
+              lapply(., function(x) lapply(x, sort)) %>%
+              lapply(., function(x) lapply(x, paste, collapse="|")) %>%
+              lapply(., unlist) %>%
+              set_names(names(alt.idx))
+        
+        #collapse primary fusions with pipe and search through alternate breakpoints if any
+        primary_list <- lapply(primary[callers_to_check], paste, collapse="|")
+        for (caller in callers_to_check){
+            name <- "Alternate.Breakpoints."
+            other_caller <- callers_to_check[callers_to_check != caller]
+            res <- any(c(primary_list[[caller]], alt_list[[paste0(name, caller)]]) %in% 
+                         c(primary_list[[paste0(name,other_caller)]], alt_list[[paste0(name, other_caller)]]))
+            alt_check <- c(alt_check,res)
+        }
+      }
+        
+      #check that there is an intersection of breakpoints between the two callers
+      if(!is.null(alt_check) & all(alt_check)){
+          comp <- paste0(names(diff)[i],": both_in_alternate_breakpoints")
+          # print(comp)
+          results_of_alt_breakpoints <- c(results_of_alt_breakpoints, comp)
+      }else{
+        #begin a direct breakpoint comparison between the two callers by adding +/- 5bp
+        # print("inside breakpoint comp")
+      
+        #convert genomic position from string to numeric values 
+        #keep chromosome as string due to chr X and Y
+        numeric_brkpts <-  lapply(primary[callers_to_check], function(x){
+              df <- str_split_fixed(x, pattern=":", n = 2) %>% 
+                as.data.frame() %>% 
+                rename_all(~c("chr","pos")) %>%
+                mutate(pos=as.numeric(pos),
+                       group=c("geneA","geneB"))
+              return(df)})
+        
+        #Add +/- 5bp to each genomic position
+        add_buffer <- lapply(numeric_brkpts, function(brkpoints_df){ 
+            genomic_positions <- brkpoints_df; 
+            chromosomes <- genomic_positions[,"chr"];
+            pos <- genomic_positions[,"pos"];
+            
+            for(n in c(-5:-1, 1:5)){ #avoid addition of 0 with seq(-5,5,by=1)
+              padding <- pos + n
+              genomic_positions <- add_row(genomic_positions,
+                                           chr=chromosomes,
+                                           pos=padding,
+                                           group=c("geneA","geneB"))
+            }
+          
+          #paste chr and pos to create exact breakpoint locations again
+          #seperate by chromosome for the two break points
+          genomic_positions <- genomic_positions %>% 
+            mutate(breakpoint=paste(chr, pos, sep=":")) %>% 
+            spread(group, breakpoint) %>% 
+            select(geneA, geneB)
+  
+          return(genomic_positions)
+        })
+        
+        #Create matrices with every combination  of +/- 5bp around the breakpoint 
+        bool.pc1 <- !is.na(add_buffer[[callers_to_check[1]]][,"geneA"])
+        padded_combos_1 <- expand.grid(add_buffer[[callers_to_check[1]]] [[1]] [bool.pc1], 
+                                       add_buffer[[callers_to_check[1]]] [[2]] [!bool.pc1]) %>% 
+          mutate(breakpoints_tolerance=paste(Var1,Var2,sep="|"))
+        
+        bool.pc2 <- !is.na(add_buffer[[callers_to_check[2]]][,"geneA"])
+        padded_combos_2 <- expand.grid(add_buffer[[callers_to_check[2]]] [[1]] [bool.pc2], 
+                                       add_buffer[[callers_to_check[2]]] [[2]] [!bool.pc2]) %>% 
+          mutate(breakpoints_tolerance=paste(Var1,Var2,sep="|"))
+        
+        #check that any combination of breakpoints +/- 5bp are in either caller 
+        if(any(padded_combos_1$breakpoints_tolerance %in% padded_combos_2$breakpoints_tolerance |
+               padded_combos_2$breakpoints_tolerance %in% padded_combos_1$breakpoints_tolerance)){
+          comp <- paste0(names(diff)[i],": +/-5bp_matched_breakpoints")
+        }else if(!any(padded_combos_1$breakpoints_tolerance %in% padded_combos_2$breakpoints_tolerance |
+               padded_combos_2$breakpoints_tolerance %in% padded_combos_1$breakpoints_tolerance)){
+          comp <- paste0(names(diff)[i], ": different_breakpoints")}
+        
+      #create a vector with the results of any searches for +/- 5bp breakpoint positions 
+      results_of_bp_padding_comp <- c(results_of_bp_padding_comp, comp)
+      }
+    }
+    
+  #Paste together the results of the comparisons  
+  comp <- list(ident, results_of_alt_breakpoints, results_of_bp_padding_comp)
+  comp <- comp[!sapply(comp, is.null)]
+  comp <- paste(sort(unlist(comp)), collapse = "\n")
+  
+  return(comp)  
+  }
+}
+  
+```
+
+
+#Read in the Clinical Data
+
+```{r}
+CDE.merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_12.09.20.csv"))
+
+CDE.merged <- CDE.merged %>% 
+  filter(!is.na(USI), USI != "Unknown")
+
+head(CDE.merged[,1:5])
+dim(CDE.merged)
+```
+
+```{r}
+manifest <- read.csv("TARGET_AML_0531_1031_Relapse_Discovery_Sample_Manifest.csv")
+
+# manifest <- read.csv(file.path(TARGET,"SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_10.08.20.csv")) %>% 
+#   #add Stella
+#   add_row(Sample="S.1327", USI="S.1327", Time_point="relapse", Group="AML")
+
+
+dim(manifest) #2319   15
+head(manifest)
+```
+
+
+
+#Fusion Data bases
+
+```{r}
+dbs <- readRDS("Fusion_Reference/Fusion_ReferenceFiles_10.8.18.RDS")
+
+sapply(dbs, dim)
+```
+
+
+
+#Read in the Fusion Call Rules and Fusions of Interest (FOI)
+
+```{r}
+rules <- read.csv("Fusion_Reference/Fusion_calling_rules.csv")
+head(rules)
+```
+
+```{r}
+FOI.pair <- read.csv("Fusion_Reference/Fusions_of_Interest.csv", header = FALSE) %>%
+  unique()
+
+head(FOI.pair)
+dim(FOI.pair)
+```
+
+```{r}
+FOI.single <- read.csv("Fusion_Reference/Fusions_with_Multiple_Partners.csv", header = FALSE)
+
+head(FOI.single)
+# dim(FOI.single)
+```
+
+
+#Read in the merged fusion file
+
+```{r}
+fusions <- read.csv("Combined/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_FusionCalls_Annotated.csv")
+  
+
+head(fusions[,1:5])
+dim(fusions) #182596    159
+length(unique(fusions$Patient)) #2313
+```
+
+```{r}
+table(unique(fusions$Patient) %in% manifest$Sample)
+# unique(fusions$Patient)[!unique(fusions$Patient) %in% manifest$Sample]
+```
+
+
+
+
+#Rules for Cohort Selection
+
+Step	Action	Confidence
+
+*These are detectected by at least 2/3 methods*
+1	Identify fusion of interest (FOI) detected by all 3 methods (TransAbyss, STAR, Targeted Alignment)	Level 1
+2	Identify FOI detected by 2 methods (TransAbyss, STAR) whereby at least one method had >10 spanning reads	Level 1
+3	Identify FOI detected by 2 methods (TransAbyss, STAR) where both methods had <10 spanning reads	Level 1
+
+*These would be detected by only 1 method*
+4	Identify FOI detected by TransAbyss only	Level 2
+5	Identify FOI detected by STAR only	Level 2
+6	Identify FOI, out of frame	Level 2 (this would have been done when assigning "primary fusion status". Such that in-frame mutations were prioritized, but nothing was filterout for being out-of-frame. So if a patient had an FOI and it was ONLY detected as out-of-frame, that would have become its primary fusion for all calls for that fusion gene-pair)
+
+*These are non-of-interest, so just ranking them lower though the confidence that they are real is high, but not confident that they contribute to disease*
+7	Identify non-fusion of interest (NFOI) detected by 2 methods (TransAbyss, STAR) whereby at least one method had >10 spanning reads	Level 3
+8	Identify NFOI detected by 2 methods (TransAbyss, STAR) where both methods had <10 spanning reads	Level 3
+
+*These are non-of-interest, and are complete singletons*
+9	Identify NFOI detected by TransAbyss only	Level 4
+10	Identify NFOI detected by STAR only	Level 4
+
+
+#Reformat the Fusions to be Searchable 
+
+
+Since our defined "confidence levels" are somewhat determined by the frequency of the fusion (at least in the next step, in order to remove false positives), it makes sense to categorize the confidence levels for all samples, including the previous Batch1/2 combined fusion calls. 
+
+```{r}
+FOI.pair_Reciprocals <- FOI.pair %>%
+  separate(V1, c("GeneA","GeneB"), sep="-",remove = FALSE) %>%
+  mutate(V2=paste(GeneB,GeneA, sep="-")) %>%
+  gather(var,Fusion,-GeneA,-GeneB) %>%
+  select(Fusion) %>%
+  unique()
+```
+
+```{r}
+FOI.regex <- FOI.single %>%
+  add_row(V1=c(paste0("HOXA",1:11),
+               paste0("HOXB", 1:11))) %>%
+  mutate(leftGene=paste0("^", V1, "-"), 
+         rightGene=paste0("-", V1,"$")) %>%
+  unite(Regex, leftGene, rightGene, sep = "|") %>%
+  select(Regex) %>% 
+  unlist() %>%
+  paste(., collapse = "|")
+
+FOI.regex
+```
+
+
+#Begin the fusion cohort selection 
+
+```{r}
+library(furrr)
+```
+
+Code with Targeted Alignment:
+    mutate(TA.Fusion.NAs = !is.na(Fusion.TA), 
+           STAR.Fusion.NAs = !is.na(X.Fusion.STAR), 
+           TargAlign.Fusion.NAs = !is.na(FusionName.TargAlign)) %>%
+      
+    mutate(All_Fusions_Called=gsub("NoneDetected", "NonePassedFilter", All_Fusions_Called)) %>%
+    
+    rowwise() %>%
+    mutate(Num_FusionCaller_Hits=sum(TA.Fusion.NAs,STAR.Fusion.NAs,TargAlign.Fusion.NAs)) %>%
+    #NOTE: Above it states that using TransAbyss and STAR are the two read count fitlers. So, can change later to be consistent. Curious to see 2/3 generally.
+    mutate(Counts_Greater_10=any(spanning_reads.TA > 10 | SpanningRead.STAR > 10 | Hit.Count.TargAlign > 10 , na.rm = T)) %>%
+
+```{r}
+table(fusions$Fusion.Detected.CICERO, useNA='ifany')
+table(fusions$Fusion.Detected.TA, useNA='ifany')
+```
+
+```{r}
+tictoc::tic()
+
+fusions_hitcounts <- fusions %>%
+
+    ###No longer using the Targeted Alignment data, but keeping it in the file. 
+    mutate_at(vars(Fusion.TA,
+                   X.Fusion.STAR,
+                   Fusion.Category.CICERO,
+                   FusionName.TargAlign),
+              ~ifelse(.=="", NA, .)) %>%
+    mutate(TA.Fusion.NAs = !is.na(Fusion.TA),
+           STAR.Fusion.NAs = !is.na(X.Fusion.STAR), 
+           CICERO.Fusion.NAs=!is.na(Fusion.Category.CICERO),
+           sum.reads.CICERO=NumReadsA.CICERO+NumReadsB.CICERO, na.rm = T) %>% 
+
+    #WHY?? Do I change this back....??
+    mutate(All_Fusions_Called=gsub("NoneDetected",
+                                   "NonePassedFilter", All_Fusions_Called))
+
+tictoc::toc()
+
+
+dim(fusions_hitcounts) #182596    168
+table(fusions_hitcounts$STAR.Fusion.NAs)
+table(fusions_hitcounts$CICERO.Fusion.NAs)
+table(fusions_hitcounts$TA.Fusion.NAs)
+quantile(fusions_hitcounts$sum.reads.CICERO,na.rm=T)
+```
+
+```{r}
+plan("multisession") 
+
+tictoc::tic()
+
+fusions_rules <- future_map_dfr(.x = 1:nrow(fusions_hitcounts), 
+                                .f = function(i){ 
+              print(i)
+              
+              fusions_hitcounts %>% 
+                slice(i) %>% 
+                
+                #Tally the number of callers that found the fusion plus associated read evidence
+                mutate(Num_FusionCaller_Hits=sum(TA.Fusion.NAs,STAR.Fusion.NAs, CICERO.Fusion.NAs)) %>%
+                mutate(Counts_Greater_10=any(spanning_reads.TA > 10 | SpanningRead.STAR > 10 |
+                                               sum.reads.CICERO > 10, na.rm = T )) %>%
+            
+                #Create confidence levels based on number of callers/read evidence
+                mutate(ConfidenceLevel__byFusionsOfInterest__Detailed=case_when(
+                    All_Fusions_Called == "NonePassedFilter" ~ "None",
+            
+                      Num_FusionCaller_Hits == 3 & (All_Fusions_Called %in% FOI.pair_Reciprocals$Fusion | 
+                                                      grepl(FOI.regex, All_Fusions_Called)) ~ "Level1_FOI_3Callers",
+                      Num_FusionCaller_Hits == 2 & 
+                      Counts_Greater_10 & (All_Fusions_Called %in% FOI.pair_Reciprocals$Fusion | 
+                                             grepl(FOI.regex, All_Fusions_Called)) ~ "Level1_FOI_2Callers_Greater10reads",
+                      Num_FusionCaller_Hits == 2 & 
+                      ! Counts_Greater_10 & (All_Fusions_Called %in% FOI.pair_Reciprocals$Fusion | 
+                                               grepl(FOI.regex, All_Fusions_Called)) ~ "Level1_FOI_2Callers_Less10Reads",
+            
+                      Num_FusionCaller_Hits == 1 & 
+                      Counts_Greater_10  & (All_Fusions_Called %in% FOI.pair_Reciprocals$Fusion | 
+                                              grepl(FOI.regex, All_Fusions_Called)) ~ "Level2_FOI_1Caller_Greater10reads",
+                      Num_FusionCaller_Hits == 1 & 
+                      ! Counts_Greater_10  & (All_Fusions_Called %in% FOI.pair_Reciprocals$Fusion | 
+                                                grepl(FOI.regex, All_Fusions_Called)) ~ "Level2_FOI_1Caller_Less10reads",
+            
+                      Num_FusionCaller_Hits == 3 & 
+                      (! All_Fusions_Called %in% FOI.pair_Reciprocals$Fusion | 
+                         !grepl(FOI.regex, All_Fusions_Called)) ~ "Level3_NFOI_3Callers",
+                      
+                    Num_FusionCaller_Hits == 2 & 
+                      Counts_Greater_10 & (! All_Fusions_Called %in% FOI.pair_Reciprocals$Fusion | 
+                                             !grepl(FOI.regex, All_Fusions_Called)) ~ "Level3_NFOI_2Callers_Greater10reads",
+                      Num_FusionCaller_Hits == 2 & 
+                      ! Counts_Greater_10 & (! All_Fusions_Called %in% FOI.pair_Reciprocals$Fusion |
+                                               !grepl(FOI.regex, All_Fusions_Called)) ~ "Level3_NFOI_2Callers_Less10reads",
+            
+                      Num_FusionCaller_Hits == 1 & (! All_Fusions_Called %in% FOI.pair_Reciprocals$Fusion |
+                                                      !grepl(FOI.regex, All_Fusions_Called)) ~ "Level4_NFOI_1Caller", 
+                      Num_FusionCaller_Hits == 0 ~ "Level4_NFOI_TargAlignOnly")) %>%
+            
+                mutate(Confidence_AllFusions=case_when(
+                                        All_Fusions_Called == "NonePassedFilter" ~ "None",
+            
+                                        Num_FusionCaller_Hits == 3  ~ "3Callers",
+                                        Num_FusionCaller_Hits == 2 & Counts_Greater_10   ~ "2Callers_Greater10reads",
+                                        Num_FusionCaller_Hits == 2 & ! Counts_Greater_10   ~ "2Callers_Less10Reads",
+            
+                                        Num_FusionCaller_Hits == 1 & Counts_Greater_10   ~ "1Caller_Greater10reads",
+                                        Num_FusionCaller_Hits == 1 & ! Counts_Greater_10   ~ "1Caller_Less10reads",
+                                        Num_FusionCaller_Hits == 0 ~ "TargAlignOnly")) %>%
+                ungroup() 
+}, .progress = TRUE)
+
+tictoc::toc() #291.514 sec elapsed so about half of what it was (but this parellization only works sometimes. seriously. same code, double the time to finish running....)
+
+dim(fusions_rules) #182596    168
+length(unique(fusions_rules$Patient))
+# saveRDS(fusions_rules, "Combined_withConfidence_Levels/TARGET_AML_fusions_rules_temp.RDS")
+```
+
+
+```{r}
+fusions_rules.clean <- fusions_rules %>% 
+    mutate(ConfidenceLevel__byFusionsOfInterest=str_split_fixed(ConfidenceLevel__byFusionsOfInterest__Detailed,
+                                                               "_", n=3)[,1],
+          Fusion_of_Interest=str_split_fixed(ConfidenceLevel__byFusionsOfInterest__Detailed, "_", n=3)[,2]) %>%
+                                mutate_at(vars(Fusion_of_Interest), ~ifelse( grepl("^$", Fusion_of_Interest), "None", .)) %>%
+    
+    #Create a Fusion.Category in which gene partners are alphabetically ordered.
+    #This allows all NUP98-NSD1 and NSD1-NUP98 fusions to be categorized together for example
+    separate(All_Fusions_Called,c("GeneA","GeneB"), sep="-", 
+              extra="merge", fill="right", remove = FALSE) %>% 
+  
+    #Update the fusion confidence for fusions that might have the same fusion partner "more-or-less"
+    #for example: a single patient with  TA calls NUP98-HOXA9.HOXA10, while STAR calls NUP98-HOXA9. 
+    #Should count as L1 evidence for that patient. 
+    group_by(Patient) %>% 
+    mutate_at(vars(ConfidenceLevel__byFusionsOfInterest__Detailed,
+                   ConfidenceLevel__byFusionsOfInterest), 
+              ~case_when(
+      any(grepl("HOXA10.HOXA9-NUP98",Fusion.Category) & grepl("HOXA9-NUP98",Fusion.Category)) ~ gsub("Level2","Level1", .),
+      TRUE ~ . )) %>% 
+    
+  
+    select(USI:Primary.Cytogenetic.Code,
+         Type,All_Fusions_Called,
+         Fusion.TA, X.Fusion.STAR, 
+         FusionName.TargAlign,Fusion.Category.CICERO,
+         Fusion.Category,
+         ConfidenceLevel__byFusionsOfInterest,
+         everything()) %>% 
+  arrange(Fusion.Category,Patient)
+
+
+tictoc::toc() #
+
+length(unique(fusions_rules.clean$Patient))
+dim(fusions_rules.clean) #182596    176
+```
+
+```{r}
+# filter(fusions_rules, grepl("HOXA9-NUP98",Fusion.Category)) %>%
+#   select(Patient,Fusion.Category, ConfidenceLevel__byFusionsOfInterest__Detailed, ConfidenceLevel__byFusionsOfInterest)
+# 
+# filter(fusions_rules,grepl("HOXD13", Fusion.Category))
+```
+
+
+
+
+##Examine the Frequencies of each Category
+
+
+```{r}
+table(fusions_rules.clean$Num_FusionCaller_Hits) 
+```
+
+```{r}
+##These should not affect any of Rhondas results as she did not use the Targeted Alignment data either
+
+
+# filter(fusions_rules.clean, Num_FusionCaller_Hits==0) %>%
+#   select(Patient, X.Fusion.STAR, Fusion.TA,matches(".TargAlign")) %>%
+#   View()
+
+# filter(fusions_rules.clean, Num_FusionCaller_Hits==0) %>%
+#   select(Patient,Fusion.Category,Num_FusionCaller_Hits, contains("Confidence")) %>% 
+#   View()
+#   
+```
+
+```{r}
+table(fusions_rules.clean$ConfidenceLevel__byFusionsOfInterest, useNA = 'ifany')
+```
+
+```{r}
+table(fusions_rules.clean$ConfidenceLevel__byFusionsOfInterest__Detailed, 
+      useNA='ifany')
+```
+   
+```{r}
+table(fusions_rules.clean$Confidence_AllFusions) %>%
+  as.data.frame()
+```
+
+
+
+# Create Binary Columns for Each Fusion of Interest 
+
+These columns will be for the cohort selection and will be 1 patient per row. 
+Each will encompass both the reciprocal of the fusions. 
+
+So, Started with a wide net of specific fusions of interest that were found in the dataset. 
+Then in the cleaning step, fusion cohorts (of any size from 1 patient to hundreds of patients with that call), were fitlered if every singe patient with that fusion had only weak (level2) evidence for it. This helped to remove MECOM-PRDM16, and a number of singletons who were very low confidence, with 1 caller and < 10 reads supporting it. 
+
+Then, the only fusion cohorts who would be included in the binary coded columns would have AT LEAST 3 patients and AT LEAST 1 patient with high confidence, strong evidence of the fusion (level1)
+
+
+##For Specific Fusion Partners 
+
+```{r}
+# any(!grepl("-", fusions_rules$Fusion.Category)) #OK 
+# filter(fusions_rules, !grepl("-", Fusion.Category)) %>% View()
+```
+
+```{r}
+#For fusions with multiple partners, will need to define my own list of fusion partners and add to those that Rhonda provided. 
+multiple.partners <- fusions_rules.clean %>%
+  ungroup() %>%
+  dplyr::filter(grepl(FOI.regex, Fusion.Category)) %>%
+  select(Fusion.Category) %>%
+  unique()
+
+
+head(multiple.partners)
+dim(multiple.partners) #1325    1
+# View(multiple.partners)
+```
+
+```{r}
+fus.to.include <- FOI.pair %>% 
+  add_row(V1=multiple.partners$Fusion.Category) %>%
+  separate(V1, c("g1","g2"), sep="-") %>%
+  
+  rowwise() %>%
+  mutate(Fusion.Category=category(g1,g2)) %>%
+  ungroup() %>%
+  
+  select(-g1,-g2) %>%
+  unique()
+
+
+head(fus.to.include)
+dim(fus.to.include) # 1333    1
+
+# write.csv(fus.to.include,"Combined_withConfidence_Intervals/TARGET_AML_0531_1031_Relapse_Discovery_FusionsOfInterst_FullList.csv",  row.names = FALSE)
+```
+
+
+```{r}
+#Function to create Yes/No/Intermediate (orginally was yes/no so was infact binary)
+binary_fusion_calls <- function(fusions.df,FOI){
+
+  #Create df to hold FOI and its reciprocal. 
+  FOI.df <- data.frame(FOI=FOI) %>%
+      separate(FOI, c("g1","g2"), sep="-") %>% 
+      mutate(reciprocol=paste(g2,g1, sep="-"),
+              original=paste(g1,g2, sep="-")) %>% 
+      mutate(regex=paste(paste0("^",original, "$"), paste0("^",reciprocol,"$"), sep="|")) 
+    
+
+  #regex for filtering. 
+  regex <- FOI.df[,"regex"]
+  
+  #Define Column names for the binary fusion calls 
+  fusion <- FOI.df[,"original"] %>%
+    gsub("-","_", .)
+  col.name <- paste0(fusion, "__RNASeqCalls")
+  cols <- c("ConfidenceLevel__byFusionsOfInterest__Detailed")
+
+  #Filter the fusions for only positives and define binary columns + detailed columns.
+  df <- fusions.df %>%
+    select(Patient,Fusion.Category, cols) %>%
+    filter(grepl(regex, Fusion.Category)) %>%
+    mutate(!! col.name := case_when(grepl("Level1", ConfidenceLevel__byFusionsOfInterest__Detailed) ~ "Yes",
+                                    grepl("Level2", ConfidenceLevel__byFusionsOfInterest__Detailed) ~ "Intermediate", 
+                                    grepl("Level4", ConfidenceLevel__byFusionsOfInterest__Detailed) ~ "TargAlignOnly")) %>%
+    select(-Fusion.Category)
+  
+  #Final rename of columns and gather the data.frame into long format. 
+   df <- df %>%
+      rename_at(vars(cols),~paste0(fusion,"__",cols)) %>% 
+      gather(Fusion.Category, Details, -Patient)
+  
+  return(df)
+  
+}
+```
+
+
+```{r}
+future::plan("multisession")
+
+tictoc::tic()
+#Note = input is the alphabetically ordered fusion category for ease of merging/tallying later on
+fusion_binCalls <- future_map_dfr(.x = fus.to.include$Fusion.Category,
+                                  .f = binary_fusion_calls, 
+                                  fusions.df=fusions_rules.clean) 
+
+
+tictoc::toc() #225.676 sec elapsed
+
+
+head(fusion_binCalls)
+dim(fusion_binCalls) #11246     3
+length(unique(fusion_binCalls$Patient)) #1797
+```
+
+
+
+## Clean the Fusion Calls Binary Columns
+
+```{r}
+#This is to just document the fusions that were filtered off due to weak evidence for all cases (not a single case has strong evidence level1 evidence)
+
+weak_evidence_calls <- fusion_binCalls %>%
+  #Unique for patient with multiple hits on the multi-partner FOIs.
+  #Like KMT2A-ABL1 and KMT2A-MLLT10 in one patient would seperately result with a colulm called KMT2A.Rearranged__RNASeqCalls (2 identical rows.)
+  unique(.) %>%
+  select(everything(), Category=Fusion.Category) %>%
+  
+  
+  #find the fusions that will be removed the "FOI" designations. 
+  filter(grepl("ConfidenceLevel__byFusionsOfInterest__Detailed", Category)) %>%
+  
+  #Create a column for the Fusion for grouping
+  mutate(Fusion.Category=str_split_fixed(Category, "__", n=3)[,1] %>%
+           gsub("_","-", .)) %>%
+
+    
+  #Group by fusion and select ones with the havign a whole cohort, of any size, from n=1 or greater, that have only level2 evidence.
+  group_by(Fusion.Category) %>%
+  mutate(Number=n()) %>%
+  mutate(Cohort_Only_L2_Evidence=sum(grepl("Level2|Intermediate|TargAlignOnly", Details)) == n()) %>% 
+  ungroup() %>% 
+
+  filter(Cohort_Only_L2_Evidence==TRUE) %>%
+  left_join(., select(fusions_rules.clean,Patient,Fusion.Category,
+                      X.Fusion.STAR, Fusion.TA, 
+                      Fusion.Category.CICERO,
+                      FusionName.TargAlign,
+                      matches("^Breakpoint.[CTS]"),
+                      matches("Blacklist|^Present_in")),
+            by=c("Patient","Fusion.Category")) %>%
+  
+  rowwise() %>% 
+  mutate(Found_in_DBs=sum(sum(!is.na(Present_in_fusionCancer_byFusionName)), 
+                          sum(!is.na(Present_in_mitelman_byFusionName)),
+                          sum(!is.na(Present_in_ticdb_byFusionName)),
+                          sum(!is.na(Present_in_cosmic_byFusionName)),
+                          sum(!is.na(Present_in_tumorFusion_byFusionName)))) %>%  
+   ungroup() %>%
+   
+    # a handful of fusions, ex AHI1-MYB, had the vast majority of fusions found in the blacklist by breakpoint,
+    #yet 3 patients had different breakpoints. these are likely not real either
+   group_by(Fusion.Category) %>%      
+   mutate(Found_in_blacklist=any(!is.na(FailedBlacklist_byBreakpoint)| 
+                                  !is.na(FailedBlacklist_byFusionName))) %>% 
+   ungroup() %>%
+  
+  arrange(desc(Number), Fusion.Category)  
+
+
+
+dim(weak_evidence_calls) #3769   22
+head(weak_evidence_calls)
+# length(unique(weak_evidence_calls$Fusion.Category)) #1,096 fusions
+# write.csv(weak_evidence_calls,"Combined_withConfidence_Levels/TARGET_AML_0531_1031_Relapse_Discovery_weakEvidenceCalls_perPatient_annotated.csv")
+
+
+# View(weak_evidence_calls)
+```
+
+```{r}
+table(weak_evidence_calls$Found_in_DBs) #138 found in fusion DBs
+table(weak_evidence_calls$Found_in_blacklist) # 127 in fusion blacklist 
+``` 
+
+
+```{r}
+#Don't filter these out 
+toInclude <- weak_evidence_calls %>%
+  filter(Cohort_Only_L2_Evidence & Found_in_DBs > 0 & Found_in_blacklist == FALSE ) %>%
+  group_by(Fusion.Category, Found_in_DBs) %>%
+  summarise(N=n()) %>% 
+  arrange(desc(N))  %>% 
+  ungroup()
+
+dim(toInclude)
+# View(toInclude)
+```
+
+```{r}
+#remove these fusions due to weak evidence
+weak_evidence_list <- weak_evidence_calls %>%
+  filter(Cohort_Only_L2_Evidence & (Found_in_DBs == 0 | Found_in_blacklist > 0 )) %>% 
+  
+  select(Fusion.Category,Number.Patient.with.Fusion=Number) %>%
+  unique() %>%
+  arrange(desc(Number.Patient.with.Fusion))
+
+
+dim(weak_evidence_list) #1093    2
+# View(weak_evidence_list)
+# write.csv(weak_evidence_list, "Combined_withConfidence_Levels/TARGET_AML_0531_1031_Relapse_Weak_Evidence_FOIs_FilteredOut.csv", row.names = TRUE) #1,068 FOI will be filtered out.
+```
+
+```{r}
+fusion_binCalls.clean <- fusion_binCalls %>%
+  #Unique for patient with multiple hits on the single FOIs. 
+  #Like KMT2A-ABL1 and KMT2A-MLLT10 in one patient would seperately result with a colulm called KMT2A.Rearranged__RNASeqCalls (2 identical rows.)
+  unique(.) %>%
+  select(Patient,Category=Fusion.Category, everything()) %>% #I should not have used the same colname for different definitions of the data
+  
+  #Filter Fusion Categories with less than 3 patients. To aid with usability 
+  group_by(Category) %>%
+  filter(n() >= 3) %>%
+  ungroup() %>%
+  
+  # Create a column for the Fusion for grouping
+  mutate(Fusion.Category=str_split_fixed(Category, "__", n=3)[,1] %>%
+           gsub("_","-", .)) %>%
+  
+  group_by(Fusion.Category) %>%
+  mutate(Number=n()) %>%
+  mutate(Cohort_Only_L2_Evidence=sum(grepl("Level2|Intermediate|TargAlignOnly", Details)) == n()) %>% 
+  ungroup() %>%
+
+  #Mutation DB Annotation Information
+  left_join(., select(fusions_rules,Patient,
+                      Fusion.Category,
+                      X.Fusion.STAR, 
+                      Fusion.TA, FusionName.TargAlign,
+                      matches("Blacklist|^Present_in")),
+            by=c("Patient", "Fusion.Category")) %>%
+  
+  #Tally how many fusions found in DBs and in blacklists
+  rowwise() %>%
+  mutate(Found_in_DBs=sum(sum(!is.na(Present_in_fusionCancer_byFusionName)),
+                          sum(!is.na(Present_in_mitelman_byFusionName)),
+                          sum(!is.na(Present_in_ticdb_byFusionName)),
+                          sum(!is.na(Present_in_cosmic_byFusionName)),
+                          sum(!is.na(Present_in_tumorFusion_byFusionName)))) %>% 
+  ungroup() %>% 
+  
+  group_by(Fusion.Category) %>%
+  mutate(Found_in_blacklist=any(!is.na(FailedBlacklist_byBreakpoint)|
+                                  !is.na(FailedBlacklist_byFusionName))) %>%
+  ungroup() %>%
+
+  #Group by fusion and remove those with the havign a whole cohort, of any size, from n=1 or greater, that have only level2 evidence. Unless the fusion has evidence in a corroborating database
+  filter(!Cohort_Only_L2_Evidence |
+           (Cohort_Only_L2_Evidence & Found_in_DBs > 0  & Found_in_blacklist == FALSE )) %>%
+  select(Patient,Category, Details) %>%
+
+  #Spread into separate columns
+  spread(Category, Details)  %>%
+  
+  # #Add in the remaining patients who did not have an FOI
+  add_row(Patient=setdiff(fusions_rules$Patient, .$Patient)) %>%
+  mutate_at(vars(ABL1_BCR__ConfidenceLevel__byFusionsOfInterest__Detailed:NCOL(.)),
+            ~ifelse(is.na(.), "No", .)) 
+
+
+head(fusion_binCalls.clean)
+dim(fusion_binCalls.clean) #2313  151
+length(unique(fusion_binCalls.clean$Patient)) # 2313
+```
+
+```{r}
+# unique(str_split_fixed(colnames(fusion_binCalls.clean), "__", n=2)[,1]) #76 fusions
+```
+
+
+
+## Update the column names for Certain FOI
+
+This is to prevent confusion for columnames like "ERG.FUS" which is known as FUS.ERG usually and NUP98-NSD1/KDM5A is also "backwards" compared to how its normally written. 
+
+```{r eval=FALSE}
+FOI.pair_colnames <- FOI.pair %>%
+  filter(V1 != "MLLT10-KMT2A") %>%
+  separate(V1, c("GeneA","GeneB"), sep="-", 
+           remove = FALSE) %>%
+  mutate(V1=gsub("-", "_", V1),
+         V2=paste(GeneB,GeneA, sep="_")) #%>%
+
+# head(FOI.pair_colnames)
+
+cols <- sapply(FOI.pair_colnames$V2, 
+               function(x) grep(x, colnames(fusion_binCalls.clean), value=TRUE)) 
+
+
+idx <- which(sapply(cols, length) > 0)
+cols <- cols[idx] 
+cols <- unlist(cols)
+names(cols) <- NULL
+
+df_colnames <- str_split_fixed(cols, "_", n=2) %>%
+  as.data.frame(., stringsAsFactors=FALSE) %>%
+  mutate(g2=gsub("__.+", "", V2)) %>%
+  mutate(newColName=paste0(paste(g2,V1,sep="_"), gsub("^[A-Z].+(__[CR].+)","\\1", V2)))
+
+# df_colnames
+
+i <- sapply(FOI.pair_colnames$V2, function(x) grep(x, colnames(fusion_binCalls.clean))) %>%
+  unlist()
+
+
+# colnames(fusion_binCalls.clean)[i] <- df_colnames$newColName
+# head(fusion_binCalls.clean)
+```
+
+
+## Merge FOI Information with Binary Columns 
+
+```{r}
+collapseRows <- function(col, uniq=FALSE){
+  #designed for dplyr so that col is the vector of the column name
+  if (uniq){col <- unique(col)}
+  
+  collapsed <- ifelse(all(is.na(col)), NA, paste(col, collapse = "; "))
+  return(collapsed)
+}
+```
+
+```{r}
+fusions.collapsed <- fusions_rules.clean %>%
+  #Critical step here is the only consider FOI(level1/level2) and remove fusions whose entire cohort were weak evidence (level2 only)
+  filter(grepl("Level1|Level2", ConfidenceLevel__byFusionsOfInterest)) %>%
+  filter(! Fusion.Category %in% weak_evidence_list$Fusion.Category) %>%
+  
+  group_by(Patient) %>%
+  mutate(FOI=collapseRows(All_Fusions_Called, uniq = TRUE)) %>%
+  ungroup() %>%
+
+  group_by(Type, Patient) %>%
+  mutate(FOI_ByType=collapseRows(All_Fusions_Called, uniq = TRUE)) %>%
+  ungroup()
+
+
+
+dim(fusions.collapsed) #1,946  174
+# head(fusions.collapsed)
+# length(fusions.collapsed$Patient)
+```
+
+```{r}
+fusions.type <- fusions.collapsed %>%
+  select(Patient, FOI, FOI_ByType, Type) %>%
+  unique(.) %>%
+
+  spread(Type,FOI_ByType, fill = "") %>%
+  rename_at(vars(contains("chrom")), 
+            ~paste0("FOI.", .)) %>%
+  
+  rowwise() %>%
+  mutate(NUP98.Fusions=splitFusions(FusionCol = FOI,
+                                    regex="NUP98"), 
+         ETS_Family.Fusions=splitFusions(FusionCol = FOI, regex="ETV6|ERG|ERF|FLI1|ELF1|FEV"),
+         RUNX1.Fusions=splitFusions(FusionCol = FOI, regex="RUNX1"),
+         KMT2A.Fusions=splitFusions(FusionCol = FOI, regex="KMT2A"),
+         KMT2A_withMLLT10.Fusions=splitFusions(FusionCol = FOI, regex="KMT2A|MLLT10", both=TRUE)) %>%
+  ungroup()
+
+  
+dim(fusions.type) #1513    9
+head(fusions.type[,1:5])
+```
+
+```{r}
+fusion_binCalls.updated <- fusion_binCalls.clean %>% 
+  left_join(., fusions.type, by="Patient") %>%
+  mutate_all(~ifelse(is.na(.), "", .)) %>%
+
+  select(Patient,matches("FOI"),
+         matches("\\.Fusions"), matches("_RNASeq"), matches("_Detailed"))
+
+
+
+# View(fusion_binCalls.updated)
+head(fusion_binCalls.updated)
+dim(fusion_binCalls.updated) #2112  155
+
+# write.csv(fusion_binCalls.updated, "Combined_withConfidence_Levels/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_Condensed_Fusion_Columns_01.25.21.csv", row.names = FALSE)
+```
+
+
+
+#Breakpoint comparison
+
+```{r}
+brkpt_comp <- fusions_rules.clean %>% 
+  # filter(Patient=="TARGET.20.PARLVL.09A.01R") %>%
+   # filter(Patient=="S.1327") %>%
+  select(Patient,Fusion.Category,
+         Fusion.Category.CICERO, Fusion.TA, X.Fusion.STAR,
+         breakpoint.TA,Breakpoints.STAR, Breakpoint.CICERO,
+         Alternate.Breakpoints.TA,
+         Alternate.Breakpoints.STAR,
+         Alternate.Breakpoints.CICERO) %>%
+
+  gather(Breakpoint_Caller, Breakpoint,
+         breakpoint.TA:Alternate.Breakpoints.CICERO) %>%
+  # arrange(Fusion.Category)
+
+  group_by(Patient, Fusion.Category) %>%
+  mutate(breakpoint_comparison=comp_brkpts(Sample = Patient,
+                                           Caller_Column = Breakpoint_Caller,
+                                           Breakpoints_Column = Breakpoint)) %>%
+  ungroup() %>%
+  select(Patient, Fusion.Category, breakpoint_comparison) %>%
+  unique()
+
+
+# View(brkpt_comp)
+dim(brkpt_comp) #182596      3
+```
+
+```{r}
+
+brkpt_comp %>%
+  group_by(breakpoint_comparison) %>%
+  summarise(N=n()) %>%
+  arrange(desc(N)) %>%
+  head()
+
+#   write.csv(.,"breakpoint_comp_check.csv", row.names = FALSE)
+```
+
+```{r}
+#Need to complete a breakpoint comparison and select better columns
+#Also, remove Mono7 and del5q and instead make is a fusion only columns
+fusions_rules_comparison <- fusions_rules.clean %>% 
+  left_join(., brkpt_comp, by=c("Patient", "Fusion.Category")) %>%
+  mutate_at(vars(Fusion.Detected.STAR), ~ifelse(Batch=="dsc", "No Data", .)) %>% 
+  select(1:13, breakpoint_comparison, everything())
+
+
+dim(fusions_rules_comparison) #182596    169
+head(fusions_rules_comparison)
+```
+
+```{r}
+length(unique(fusions_rules_comparison$Patient))
+length(unique(fusions_rules_comparison$SJ_ID))
+```
+
+```{r}
+# write.csv(fusions_rules_comparison, "Combined_withConfidence_Levels/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_FusionCalls_withConfidenceLevels_Annotated_01.25.21.csv", row.names=FALSE)
+```
+
+
+
+#Split into Inter and Intra Chromosomal 
+
+```{r}
+fusions_rules_comparison <- read.csv("Combined_withConfidence_Intervals/TARGET_AML_0531_1031_Relapse_Combined_STAR_TransAbyss_CICERO_FusionCalls_withConfidenceLevels_Annotated_01.25.21.csv")
+
+dim(fusions_rules_comparison)
+```
+
+###Intra
+
+```{r}
+intra <- fusions_rules_comparison %>%
+  filter(grepl("intra|None", Type))
+  
+length(unique(intra$Fusion.Category)) #19677
+dim(intra) #112,798    173
+
+# write.csv(intra, "Combined_withConfidence_Levels/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_intrachromosomal_FusionCalls_withConfidenceLevels_Annotated_01.25.21.csv")
+```
+
+```{r}
+table(is.na(fusions_rules_comparison$Type))
+table(fusions_rules_comparison$Type)
+```
+
+
+
+###Inter
+
+
+```{r}
+inter <- fusions_rules_comparison %>% 
+  filter(grepl("inter|None", Type)) 
+
+length(unique(inter$Fusion.Category)) #36962
+dim(inter) #69,904   169
+
+
+# write.csv(inter,"Combined_withConfidence_Levels/TARGET_AML_0531_1031_Relapse_Combined_STAR_TransAbyss_CICERO_interchromosomal_FusionCalls_withConfidenceLevels_Annotated_01.25.21.csv" )
+```
+
+
+
+# Merge in the CDEs 
+
+```{r}
+table(manifest$Sample %in% fusion_binCalls.updated$Patient)
+table(fusion_binCalls.updated$Patient %in% manifest$Sample)
+
+
+manifest$Sample[!manifest$Sample %in% fusion_binCalls.updated$Patient]
+```
+
+*TO DO* 
+1. update CDEs for unknowns in the protocol! need to merge in clinical data as needed.  
+2.For CDEs, for all relapse samples, make the entries NA since that is NOT the time point at which they were taken. *
+
+```{r}
+RNAseq.Comparison.dx <- xlsx::read.xlsx(file.path(PROJHOME, '2020.04.13_CICERO_St.Jude',
+                                            "TARGET_AML_Diagnostic_RNAseq_Comparison_6.12.20.xlsx"),
+                                  sheetIndex = 1) %>% 
+  mutate_at(vars(Differences_inAdditonal),~gsub("c","C", .)) %>%
+  dplyr::select(Patient, SJ_ID=Sample.s..CICERO,
+                 Updated_Primary.Fusion, Updated_Additional.Fusions,
+                 Differences_inPrimary, Differences_inAdditonal) %>% 
+  unique() 
+
+
+dim(RNAseq.Comparison.dx) #684   6
+# head(RNAseq.Comparison.dx)
+table(duplicated(RNAseq.Comparison.dx$Patient))
+table(duplicated(RNAseq.Comparison.dx$Patient))
+# View(filter(RNAseq.Comparison.dx, duplicated(Patient)  | duplicated(Patient, fromLast = TRUE)))
+```
+
+```{r}
+SJ_IDmap <- read.csv("Fusion_Reference/St.Jude_TARGET_CICERO_Sample_IDmap.csv")
+head(SJ_IDmap)
+```
+
+```{r}
+fusions.cde <- select(fusion_binCalls.updated, Patient, FOI:KMT2A_withMLLT10.Fusions) %>%
+  mutate(USI=str_split_fixed(Patient,"\\.", n=5)[,3]) %>% 
+  # left_join(., RNAseq.Comparison.dx, 
+  #             by="Patient") %>%
+  left_join(., select(CDE.merged, Reg.,USI, Protocol,
+                      Primary.Fusion,Primary.CNV,Additional.Fusions.CNV,
+                      FLT3.ITD.positive., matches("mutation"),ISCN,everything(),-Group), 
+              by=c("USI"="USI")) %>%
+  left_join(., select(manifest,Sample,Group, Time_point), 
+              by=c("Patient"="Sample")) %>%
+  left_join(., select(SJ_IDmap, SJ.ID,Patient), 
+            by="Patient") %>% 
+  mutate_at(vars(Protocol), ~case_when(
+    is.na(.) & Group != "AML" ~ Group,
+    is.na(.) & Group == "AML" ~ "Unknown",
+    TRUE ~ .)) %>% 
+  select(Reg.,USI,Protocol, 
+           Patient,SJ.ID,
+           Group,Time_point,
+           # Differences_inPrimary,
+           # Differences_inAdditonal,
+           Primary.Fusion, Primary.CNV,
+          # Updated_Primary.Fusion,
+           Additional.Fusions.CNV, 
+           # Updated_Additional.Fusions,
+          
+           matches("FOI"), FLT3.ITD.positive.,
+           matches("mutation"),ISCN, 
+           everything()) %>% 
+  arrange(Group, Protocol, Patient)
+
+dim(fusions.cde) #2313   28
+
+# fusions.cde.final <- fusions.cde %>%
+#            #Additional columns that are not necessary for the final file,
+#             #except for my own use. I can merge in as needed. 
+#            select(-AML_Subtype,
+#            -N,-c(NUP98.NSD1:CBFA2T3.GLIS2),
+#            -c(NUP98.Fusions:KMT2A_withMLLT10.Fusions),
+#            -c(Comments:CNS.Disease.Harmonized),
+#            #I created the binary columns to be used initially, 
+#            #but now we are using Karyo+Fusion data to determine the fusion cohorts
+#            -c(ABL1_BCR__RNASeqCalls:RUNX1_SLC5A3__ConfidenceLevel__byFusionsOfInterest__Detailed))
+
+
+# dim(fusions.cde.final) #2313  161
+# View(fusions.cde.final) 
+```
+
+```{r}
+# write.csv(fusions.cde.final, "Combined_withConfidence_Intervals/TARGET_AML_0531_1031_Relapse_Combined_STAR_TransAbyss_CICERO_Cleaned_Annotated_FOI_FusionCalls_01.25.21.csv", row.names = FALSE)
+
+# write.csv(fusions.cde,"Combined_withConfidence_Levels/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_Cleaned_Annotated_FOI_FusionCalls_CDE_01.25.21.csv", row.names = F)
+
+dim(fusions.cde)
+```
+
+
+# Create the Final Primary File 
+
+This doesnt work. Ive tried all of the excel packages... and they all fail. 
+
+```{r}
+options(java.parameters = "-Xmx15000m")
+```
+
+```{r}
+## write a list of data.frames to individual worksheets using list names as worksheet names
+fname="TARGET_AML_0531_1031_FusionCall_MasterFile_7.01.20.xlsx"
+# cleaned_res <- list("Primary_Fusions_CDE"=as.data.frame(fusions.cde.final),
+#                     "interchromosomal"=as.data.frame(inter),
+#                     "intrachromosomal"=as.data.frame(intra))
+
+gc()
+
+# stop(list(message = "Java Exception <no description because toString() failed>", call = .jcall(row[[ir]], "Lorg/apache/poi/ss/usermodel/Cell;", "createCell", as.integer(colIndex[ic] - 1)), jobj = new("jobjRef", jobj = <pointer: 0x556af133cf38>, jclass = "java/lang/Throwable")))
+xlsx::write.xlsx(as.data.frame(fusions.cde.final), 
+             file = fname,
+             sheetName="Primary_Fusions_CDE",
+             col.names=TRUE,
+             row.names=FALSE,
+             append=FALSE)
+
+gc()
+
+xlsx::write.xlsx(as.data.frame(inter), 
+             file = "/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2018.09.11_Combine_Fusion_Calls/TARGET_AML_0531_1031_FusionCall_MasterFile_7.01.20.xlsx",
+             sheetName="interchromosomal",
+             col.names=TRUE,
+             row.names=FALSE,
+             append=TRUE)
+
+gc()
+xlsx::write.xlsx(as.data.frame(intra), 
+             file = file.path(getwd(), fname),
+             sheetName="intrachromosomal",
+             col.names=TRUE,
+             row.names=FALSE,
+             append=TRUE)
+
+gc()
+#openXLSX Doesnt work: error in writeDataTable(wb = wb, sheet = i, x = x[[i]], startCol = startCol[[i]],
+# Column names of x must be case-insensitive unique.
+
+# openxlsx::write.xlsx(x=cleaned_res, 
+#                      file = fname,
+#                      asTable=TRUE)
+
+rm(cleaned_res)
+```
+
+
+
+
+#Define Primary Fusions 
+
+This part is done with manual curation taking into account the fusion callers and the karyotype.  
+
+Also see, ".Rmd" for the clean up of the summarized files.
+
+
+Need to clean up the *primary.fusion* and *additional.fusions* columns. 
+
+From Xiaotu Ma:
+-We have 350 records where the BP does not exact match (within a few base pairs offset, not a big deal).
+-For the 52 records that need a review, I am able to make a call for 33 records by comparing with ISCN.
+-1 record, PAWGTG, does not have fusion. It is PTEN deletion. I consider this done.
+-We have 18 records left, where only 4 has a Cicero call.
+
+Proposed next steps:
+-For the 350 records with BP-problem.  For this purpose, can you do a) by using the 320 non-ambiguous records, to define common bps for each fusion type. 
+--> You will be able to obtain data like CBFB-MYH11: fusion_type1: 10 samples; fusion_type2: 5 samples. 
+
+-You then check b) which callers in those 350 record matches such canonical data best. I feel STAR?    
+-Soheil: This will be a very cool work in that we can have a well-defined AML fusion capture panel for near future.
+
+
+-I would make a call for [JSID] 65504/64862/65268 (green highlight below).    --- let’s see how the break points of these three matches the fusion bp database next.
+For 65228 and 64950 (yellow highlight), probably we should call them as unknown for now.
+
+
+
+use following method for “secondary fusions”: 
+-if the secondary fusions involve any genes in the primary fusion, we will consider them as a “by-product”, and will not put them into the report at all. 
+-Please see how many samples would have secondary fusions after this filter.
+
+
+
+# Fusions Breakpoint Database
+
+```{r}
+fusions_rules_comparison <- read.csv("Combined_withConfidence_Intervals/TARGET_AML_0531_1031_Relapse_Combined_STAR_TransAbyss_CICERO_FusionCalls_withConfidenceLevels_Annotated_01.25.2120.csv")
+
+
+dim(fusions_rules_comparison)
+```
+
+```{r}
+subset_summarize_breakpoints <- function(fusions_df, FOI){
+  
+  genes <- str_split_fixed(FOI, pattern = "-", n=2) #paste0(genes,"\\b")
+  regex <- paste(paste(genes[,1], genes[,2], sep="-"), 
+                 paste(genes[,2], genes[,1], sep="-"), sep="|")
+    
+  df <- fusions_df %>% 
+    filter(grepl(regex, Fusion.Category)) %>% 
+    select(Patient,SJ_ID, Fusion.Category,
+           breakpoint_comparison,
+           breakpoint.TA, Breakpoints.STAR, 
+           Breakpoint.CICERO,
+        matches("Alternate.Breakpoints"),
+        Num_FusionCaller_Hits, 
+        matches("Reads?|breakpoint_pairs")) %>% 
+  
+        select(-matches("TargAlign$|^sum\\."))%>%
+        arrange(breakpoint_comparison, Patient) 
+  
+  #Clean and make into the long format for breakpoints
+  brkpts <- df %>% 
+        separate(Alternate.Breakpoints.TA,
+                 into=paste0("Alternate.Breakpoints",1:100, ".TA"),
+                 sep="; ",
+                 remove=TRUE) %>%
+        separate(Alternate.Breakpoints.STAR,
+                 into=paste0("Alternate.Breakpoints",1:100, ".STAR"),
+                 sep="; ",
+                 remove=TRUE) %>%
+        separate(Alternate.Breakpoints.CICERO,
+                 into=paste0("Alternate.Breakpoints",1:100, ".CICERO"),
+                 sep="; ",
+                 remove=TRUE) %>%
+        select_if(~!all(is.na(.))) %>%
+        
+        rowwise() %>%
+        mutate_at(vars(matches("^[bB]reakpoints?\\.[A-Z]|^Alternate.Breakpoints[0-9]")),
+                  ~sort(str_split(., pattern = "\\|")[[1]]) %>% #sort the breakpoints
+                    paste(., collapse = "|")) %>%
+        ungroup() %>%
+
+        #Create long format
+        gather(Caller, Breakpoint,
+               matches("^[bB]reakpoints?\\.[A-Z]|^Alternate.Breakpoints[0-9]")) %>%
+        filter(Breakpoint != "") %>%
+        mutate_at(vars(Caller), ~gsub("^b","B", 
+                                      gsub("Alternate.Breakpoints[0-9]{,1}",
+                                                     "Alternate_Breakpoints", .))) %>%
+        mutate_at(vars(Caller), ~gsub("s$","", 
+                                      gsub("^Breakpoints?", "Primary_Breakpoint", .))) %>%
+        separate(Caller, into=c("Breakpoint_Type", "Algorithm"), sep="\\.") %>%
+        arrange(Patient, breakpoint_comparison)
+  
+    #summary by fusion breakpoin type 
+    brkpts.summary <- brkpts %>% 
+        group_by(Patient, Breakpoint_Type) %>% 
+        filter(!duplicated(Breakpoint)) %>% 
+        ungroup() %>%
+        
+        group_by(Fusion.Category,Breakpoint_Type, Breakpoint) %>%
+        summarize(Number_Breakpoint_Called=n()) %>%
+        ungroup() %>% 
+        
+        arrange(desc(Breakpoint_Type),desc(Number_Breakpoint_Called))
+
+    #breakpioints all
+    brkpts.all <-  brkpts %>% 
+        group_by(Patient) %>% 
+        filter(!duplicated(Breakpoint)) %>% 
+        ungroup() %>%
+        
+        group_by(Fusion.Category,Breakpoint) %>%
+        summarize(Number_Breakpoint_Called=n()) %>%
+        ungroup() %>% 
+        
+        arrange(desc(Number_Breakpoint_Called))
+      
+
+      
+    write.csv(df,
+              paste0("Fusion_Breakpoints_Summary/TARGET_AML_", FOI,"_Breakpoints_PerSample.csv"),
+              row.names = FALSE)
+    write.csv(brkpts.summary,
+              paste0("Fusion_Breakpoints_Summary/TARGET_AML_",FOI,"_Breakpoints_by_Primary_Alternate_Summary_Count.csv"),
+              row.names = FALSE)
+    write.csv(brkpts.all,
+            paste0("Fusion_Breakpoints_Summary/TARGET_AML_",FOI,"_all_Breakpoints_Summary_Count.csv"),
+            row.names = FALSE)
+            
+}
+```
+
+```{r}
+grep("KMT2A",fusions_rules_comparison$Fusion.Category, value=TRUE) %>% 
+  table() %>% 
+  as.data.frame() %>% 
+  arrange(desc(Freq))
+
+grep("-ALK|ALK-",fusions_rules_comparison$Fusion.Category, value=TRUE) %>% 
+  table() %>% 
+  as.data.frame() %>% 
+  arrange(desc(Freq))
+```
+
+```{r}
+Fusions_to_summarize <- c("CBFB-MYH11","CBFA2T3-GLIS2","RUNX1-RUNX1T1", "KMT2A-MLLT3",
+                          "KMT2A-MLLT10","ELL-KMT2A","KMT2A-MLLT4","KMT2A-MLLT1",
+                          "KMT2A-SEPT6", "KMT2A-MLLT11","NUP98-NSD1","NUP98-KDM5A",
+                          "ALK-RANBP2","ALK-SPTBN1")
+```
+
+```{r}
+fusions_df <- filter(fusions_rules_comparison, 
+                     Group=="AML", 
+                     grepl("diagnostic", Time_point),
+                     grepl("Level[123]",ConfidenceLevel__byFusionsOfInterest))
+
+# head(fusions_df)
+dim(fusions_df) # 7878  175
+```
+
+```{r}
+#Need to suppress the warnings in separate()
+for(fus in Fusions_to_summarize){
+  subset_summarize_breakpoints(fusions_df = fusions_df,FOI=fus)
+}
+
+# dir("Fusion_Breakpoints_Summary")
+# dir.create("Fusion_Breakpoints_Summary/Concatenated_Summary_Files")
+```
+
+```{r}
+fus_summaries <- dir(file.path("Fusion_Breakpoints_Summary"),
+                     pattern="Primary_Alternate_Summary", 
+                     full.names = TRUE)
+
+names(fus_summaries) <- str_split_fixed(fus_summaries, "_", n=10)[,5]
+head(fus_summaries)
+```
+
+```{r}
+library(xlsx)
+outfile <- "Fusion_Breakpoints_Summary/Concatenated_Summary_Files/TARGET_AML_Fusion_Breakpoint_Summaries.xlsx"
+
+for(fus in names(fus_summaries)){
+  
+  if(!file.exists(outfile)){
+    a=FALSE
+  }else{
+    a=TRUE
+  }
+  
+  xlsx::write.xlsx(read.csv(fus_summaries[fus]), file=outfile, sheetName = fus,
+                     append = a, row.names = FALSE)
+    
+}
+```
+
+```{r}
+noquote(names(fus_summaries))
+```
+
+
+#Calculate the Frequencies of primary fusions
+
+```{r}
+Fusion.Anno.Subset <- fusions.collapsed %>%
+  select(Fusion=Fusion.Category,
+         CancerType_inMitelman_byFusionName=Morphology_inMitelman_byFusionName, 
+         matches("Mitel|Ticdb|TumorFusion|Chimera|COSMIC|FusionCancer")) %>%
+  arrange(Fusion) %>%
+  unique()
+
+head(Fusion.Anno.Subset)
+dim(Fusion.Anno.Subset) #239  11
+```
+
+```{r}
+table(fusions.cde$Group, useNA='ifany')
+```
+
+```{r}
+Frequencies <- fusions.cde %>%
+  filter(Group == "AML" ) %>% #Group == "AML",
+  select(., contains("RNASeq")) %>%
+  mutate_all(~factor(., levels=c( "No","Intermediate", "Yes"))) %>%
+  sapply(., table) %>%
+  as.data.frame() %>%
+  rownames_to_column("Levels") %>%
+  gather(Fusion_Name,Number_Patients,-Levels) %>%
+  mutate(Fusion=gsub("_", "-",str_split_fixed(Fusion_Name,"__", n=2)[,1])) %>%
+  select(-Fusion_Name) %>% 
+  spread(Levels, Number_Patients) %>%
+  mutate(Total=1929) %>%
+  
+  group_by(Fusion) %>%
+  mutate(Percent=round(Yes/Total*100, digits=2),
+         Percent_Any=round((Yes+Intermediate)/Total*100, digits = 2)) %>%
+  ungroup() %>%
+   
+
+  mutate(GeneA=str_split_fixed(Fusion,"-", n=3)[,1],
+          GeneB=str_split_fixed(Fusion,"-", n=3)[,2],
+         Inter_or_Intra_Chromosomal_Fusion=case_when(
+           Fusion %in% unique(intra$Fusion.Category) ~ "Intra",
+           Fusion %in% unique(inter$Fusion.Category) ~ "Inter")) %>% 
+  left_join(., Fusion.Anno.Subset,by="Fusion") %>% 
+
+  select(Fusion,GeneA,GeneB,Inter_or_Intra_Chromosomal_Fusion,
+         Confident_Positive=Yes, Possible_Positive=Intermediate, Negative=No,Total,
+         Percent.Positive_Confident=Percent,
+         Percent.Positive_All_Hits=Percent_Any,
+         everything()) 
+
+# head(Frequencies, n=50)
+
+# View(Frequencies)
+```
+
+
+```{r}
+# write.csv(Frequencies, "Combined_withConfidence_Intervals/TARGET_AML_0531_1031_Relapse_Combined_STAR_TransAbyss_CICERO_Cleaned_Annotated_Frequencies.csv", row.names = FALSE)
+```
+
+
+#M7 Fusions for Karen Chisholm
+
+```{r}
+supp <- read.csv(file.path(PROJHOME, "2018.07.03_M6_M7_Del5q_DEGs/M7_K.Chisholm/Supplemental_Table_1_Rhonda_Edits.csv"))
+
+dim(supp) #108  45
+head(supp)
+```
+
+```{r}
+supp_fusions <- supp %>% 
+  left_join(., filter(fusions.cde.final,
+                      Time_point=="diagnostic"),
+            by=c("TARGET.USI.1"="USI")) %>% 
+  select(TARGET.USI.1:Fusion.genes, SJ_ID:FOI.intrachromosomal)
+
+
+# View(supp_fusions)
+dim(supp_fusions)
+
+# write.csv(supp_fusions, file.path(PROJHOME, "2018.07.03_M6_M7_Del5q_DEGs/M7_K.Chisholm/Supplemental_Table_1_Rhonda_Edits_JennyEdits.csv"))
+
+supp_fusions$TARGET.USI.1[which(duplicated(supp_fusions$TARGET.USI.1))] #PASRLS must have had a replicate sample
+```
+
+```{r}
+supp_edited <- openxlsx::read.xlsx(file.path(PROJHOME, "2018.07.03_M6_M7_Del5q_DEGs/M7_K.Chisholm/Supplemental_Table_1_Rhonda_Edits_JennyEditsv1.xlsx")) %>% 
+  select(-Primary.Fusion.CNV) %>% #incomplete merge bc only included pts with RBD fusion calls
+  # filter(TARGET.USI.1 == "PASRLS")
+  filter(!duplicated(TARGET.USI.1)) %>% 
+  left_join(., supp,
+            by="Reg.",
+            suffix=c("",".2")) %>%
+  select(-matches("\\.2$|^X")) %>%
+  left_join(., select(CDE.merged, Reg., Primary.Fusion.CNV,
+                      Additional.Fusions.CNV, Cyto.vs..Seq) %>%
+              filter(!is.na(Reg.) | Reg. != "Unknown"),
+            by=c("Reg."="Reg.")) %>%
+  select(1:7, Primary.Fusion.CNV,
+                      Additional.Fusions.CNV, Cyto.vs..Seq,
+         everything())
+
+dim(supp_edited) #108  51
+# head(supp_edited)
+# View(supp_edited)
+
+# write.csv(supp_edited, file.path(PROJHOME, "2018.07.03_M6_M7_Del5q_DEGs/M7_K.Chisholm/Supplemental_Table_1_Rhonda_Edits_JennyEditsv2.csv"))
+```
+
+#PDX NUP98-Model 
+
+```{r}
+PDX <- fusions_rules_comparison %>% 
+  filter(grepl("PAXLWH", Patient), ConfidenceLevel__byFusionsOfInterest != "Level4") %>% 
+  arrange(Patient, ConfidenceLevel__byFusionsOfInterest, desc(All_Fusions_Called)) %>% 
+  mutate_at(vars(ISCN:Primary.Cytogenetic.Code), 
+            ~ifelse(Time_point != "diagnostic", NA, .))
+
+
+
+head(PDX)
+dim(PDX)
+# View(PDX)
+```
+
+
+```{r}
+table(PDX$Time_point, useNA='ifany')
+
+# write.csv(PDX,"TARGET_AML_PDX_higherConfidence_RNA-seq_Fusion_Calls.csv", row.names = FALSE)
+```
+
+```{r}
+# GINM1-PPIL4
+GINM1 <- lapply(dbs, function(x) filter(x, grepl("(GINM1|C6ORF72)-PPIL4", Fusion1, ignore.case = T) | 
+                                          grepl("(GINM1|C6ORF72)-PPIL4", Fusion2, ignore.case = T)))
+
+head(GINM1)
+```
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+

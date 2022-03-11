@@ -1,0 +1,1564 @@
+---
+title: 'Integrate Fusion Calls from TransAbyss, STAR, and Karen Mungall'
+author: "Jenny Smith"
+date: "April 8, 2019"
+output: html_document
+---
+
+#Set-up
+
+```{r setup}
+library(knitr)
+
+knitr::opts_knit$set(root.dir = file.path(PROJHOME, "2018.09.11_Combine_Fusion_Calls/"))
+
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8)
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+getwd()
+```
+
+```{r}
+source(file.path(SCRIPTS, "conversion_scripts/Merge_Cat_FixDupIDs_Function.r"))
+```
+
+
+#Define Functions
+
+```{r}
+Combine_Fusion_Callers <- function(star, ta, cicero,targAlign, Sample){
+  
+    #Create subset dataframes for each of the patient USIs.
+    #Remove the columns that they all have in common, so these can be merged back in. 
+    dup.cols <- c("ISCN","Reg.","Group","USI")
+    # print(Sample)
+    
+    sub.star <- star %>%
+      filter(Patient == Sample) %>%
+      select(-one_of(dup.cols)) %>%
+      set_colnames(paste0(colnames(.), ".STAR")) 
+    
+    sub.ta <-  ta %>%
+      filter(Patient == Sample) %>%
+      select(-one_of(dup.cols)) %>%
+      set_colnames(paste0(colnames(.), ".TA"))
+    
+    sub.cicero <-  cicero %>%
+      filter(Patient == Sample) %>% 
+      select(-one_of(dup.cols)) %>%
+      set_colnames(paste0(colnames(.), ".CICERO"))
+    
+    sub.targAlign <-  targAlign %>%
+      filter(Patient == Sample) %>% 
+      select(-one_of(dup.cols)) %>%
+      set_colnames(paste0(colnames(.), ".TargAlign"))
+    
+    #Remove the full datasets from memory and keep only the subsets
+    rm(list = c("star", "ta","cicero","targAlign"))
+    
+    #Define the Fusions. 
+    #Using the fusion.category column to allow for reciprocal fusion partners to be matched together.
+    #fusion.category was "standardized" so that each fusion pair of genes were ordered alphabetically in all datasets. 
+    #Must confirm that the reference gtf was the same. I know that STAR and TransAbyss were not, so will need to query for differences. 
+    fusions <- unique(c(
+              unlist(sub.ta$Fusion.Category.TA), 
+              unlist(sub.star$Fusion.Category.STAR),
+              unlist(sub.cicero$Fusion.Category.CICERO),
+              unlist(sub.targAlign$Fusion.Category.TargAlign))) %>%
+      .[!grepl("^$|None", .)] %>% 
+      .[!is.na(.)]
+
+
+    # print(paste("Combining ", length(fusions), "fusions."))
+    
+    #Function to merge each fusion, row by row
+    merged_fusions <- function(fusion, TA.sub, STAR.sub,
+                               CICERO.sub, TargAlign.sub){
+      
+
+      #Create a list of the subsetted dataframes
+      l <- list("TA"=TA.sub, "STAR"=STAR.sub,
+                "CICERO"=CICERO.sub, "TargAlign"=TargAlign.sub)
+      
+     #If the fusion category was equal to "", 
+      #then fusion is length zero. 
+      if(length(fusion)==0){
+          df <- bind_cols(l)
+          return(df)
+        
+      }else{ 
+      
+        #list of colnames for indexing cols
+        cols <- lapply(l, colnames)
+      
+        #Initialize an empty dataframe with the column names of all the fusion callers
+        ncol <- sum(sapply(cols, length))
+        df <- data.frame(matrix(ncol=ncol,nrow=1))
+        colnames(df) <- unlist(cols)
+        
+        #Add anchors to the fusion, for grepping fusions.
+        fusion <- paste0("^",fusion,"$")
+        idx <- lapply(l, function(x) 
+          grep(fusion, x[,grep("Fusion.Category",colnames(x))]))
+        lengths <- sapply(idx, length)
+        
+        #index for which of the 3 callers has that fusion call. 
+        i <- lengths == 1
+        c <- unlist(cols[i])
+        rows <- idx[i]
+            
+        #Select the rows with the fusion from the subsetted dataframes
+        FOI <- mapply(function(df,row){df[row,]}, l[i], rows,
+                      SIMPLIFY = FALSE) %>%
+          bind_cols()
+        
+        #populate the empty dataframe with the new information at the appropriate column names
+        df[,c] <- FOI
+        
+        return(df)
+      }
+    }
+    
+    #Run the merging function 
+    if(length(fusions)==0){
+      m <- merged_fusions(fusion=fusions, 
+                          TA.sub = sub.ta,
+                          STAR.sub = sub.star,
+                          CICERO.sub = sub.cicero,
+                          TargAlign.sub = sub.targAlign)
+    }else{
+     
+      m <- lapply(fusions,
+                  function(x) merged_fusions(fusion = x,
+                                TA.sub = sub.ta,
+                                STAR.sub = sub.star,
+                                CICERO.sub = sub.cicero,
+                                TargAlign.sub = sub.targAlign)) %>%
+         bind_rows()
+    }
+    
+  #check that no mismatches happened with Sample IDs used to subset the 3 dataframes. 
+  suffix <- c("TA","STAR","CICERO","TargAlign")
+  pt.IDs <- m[paste0("Patient.",suffix)]
+  
+  #if there is some merging or subsetting error, then print the message and exit    
+  if(all(is.na(pt.IDs))){
+    stop(paste("This sample is all NAs:",Sample))
+  }
+
+    
+  return(m)
+}
+```
+
+```{r}
+blacklistFusions <- function(c1,c2,c3,c4,c5,c6, df2.blacklist, type="Breakpoint"){
+
+  if(type=="Breakpoint"){
+    #Subset the the breakpoint.cols dataframe to those with information (not NAs).
+    df <- data.frame(c1,c2,c3,c4,c5,c6) %>%
+      select_if(~!is.na(.)) %>% #need to ensure dplyr is recent to use this notation. 
+      str_split(., ";") %>%
+      unlist()
+  
+  }else if (type=="Fusion"){
+    df <- data.frame(c1)
+    colnames(df) <- c1
+  }
+
+  #Find out if the fusion breakpoints are the black listed fusion breakpoints.
+  fus.blacklistA <- sapply(df, function(x) x %in% df2.blacklist[, paste0(type,1)])
+  fus.blacklistB <- sapply(df, function(x) x %in% df2.blacklist[, paste0(type,2)])
+  reciprocals <- c(fus.blacklistA, fus.blacklistB)
+
+  if (any(reciprocals)){
+    
+    hits <- reciprocals[which(reciprocals)]
+    if(type=="Breakpoint"){
+       res <- paste(names(hits),collapse = "; ")
+       
+    }else if (type=="Fusion"){
+       idx <-  sapply(1:2, function(x) which(df2.blacklist[, paste0(type,x)] == c1)) %>%
+         unlist()
+       
+       res <-  df2.blacklist[idx, "Breakpoint1"] %>%
+                 unique(.) %>%
+                 paste(., collapse = "; ")
+    }
+     
+  }else{
+    res <- NA #these one will not.
+  }
+
+  return(res)
+}
+```
+
+
+```{r}
+fixCommas <- function(blacklist.withCommas,col){
+
+  genes <- str_split(blacklist.withCommas[col], ",") %>%
+    unlist()
+  len <- length(genes)
+
+  #dummy data.frame
+  update <- data.frame(matrix(nrow=1,
+                              ncol=length(blacklist.withCommas),
+                              dimnames = list(NULL, names(blacklist.withCommas))))
+
+  for (i in 1:len){
+    update[i,] <- blacklist.withCommas
+    update[i,col] <- genes[i]
+  }
+
+  return(update)
+}
+
+```
+
+```{r}
+fusionCategory <- function(geneA,geneB){
+  fus <- c(geneA,geneB)
+  fus <- paste(fus[order(fus)], collapse = "-") #order alphabetically, so that the category includes  reciprocal fusions
+}
+```
+
+
+```{r}
+AnnotFusions <- function(c1, df2.annot, col="Fusion",col2="Breakpoint1", alias.df=NULL){
+
+  #Pattern Matching for the fusion of interest
+  find_inDB <- function(fusion,df2.annot,col){
+      fus.A <-  fusion %in% df2.annot[, paste0(col,1)]
+      fus.B <-  fusion %in% df2.annot[, paste0(col,2)]
+      reciprocals <- c(fus.A, fus.B)
+      
+      return(reciprocals)
+  }
+  
+  #First matching attempt on gene name. Use all caps to avoid missed hits  due to capitolization.  
+  c1 <- toupper(c1)
+  reciprocals <- find_inDB(fusion=c1, df2.annot=df2.annot, col=col)
+
+
+  if (any(reciprocals)){
+    idx <-  sapply(1:2, function(x) which(df2.annot[, paste0(col,x)] == c1)) %>%
+         unlist()
+    
+    res <-  df2.annot[idx, col2] %>%
+                 unique(.) %>%
+                 paste(., collapse = "; ")
+    
+    #If the column doesnt exist, like 3/5 dbs don't have breakpoint info, just report that its present.   
+    if(res == ""){res <- "Present"}
+      
+  }else{
+    
+    aliases <- alias_converter(fusion = c1, gene_aliases = alias.df )
+    reciprocals <- find_inDB(fusion = aliases, df2.annot=df2.annot, col=col)
+    
+    if (any(reciprocals)){
+      alias <- aliases[which(reciprocals)]
+      idx <-  sapply(1:2, function(x) which(df2.annot[, paste0(col,x)] == alias)) %>%
+         unlist()
+
+      res <-  df2.annot[idx, col2] %>%
+                 unique(.) %>%
+                 paste("Alias",., collapse = "; ")
+    
+    #If the column doesnt exist, just report that its present.   
+    if(res == ""){res <- "Present"}
+    }else{
+      
+      res <- NA
+    } #these ones are not in the data.bases
+  }
+  
+  return(res)
+}
+```
+
+
+```{r}
+alias_converter <- function(fusion, gene_aliases=NULL, sep="-") {
+  #NOTE: ensure that all fusion references, and 
+  library(dplyr)
+  library(stringr)
+  
+  # Splits the fusion into 2 genes, then creates a regex to look them up with
+  fusion <- toupper(fusion) #ensure case is not an issue 
+  gene1 <- strsplit(fusion, split = sep)[[1]][1]
+  gene2 <- strsplit(fusion, split = sep)[[1]][2]
+  regex1 <- paste0("\\b",gene1,"\\b")
+  regex2 <- paste0("\\b",gene2,"\\b")
+  
+  # Reads in a file containing a list of gene symbols and corresponding aliases for each symbol, unless provided by the gene_alias.df argument. 
+  if(is.null(gene_aliases)){
+    gene_aliases <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/Hs_GeneInfo.Symb.Alias.csv",
+                           header = TRUE, stringsAsFactors = FALSE) 
+  }
+  
+  # Identifies the aliases for each fusion gene from the alias spreadsheet above.
+  #ignore.case to double ensure, no matter which refrecne I use, capitolization is not an issue. 
+  gene1_aliases <- gene_aliases %>% 
+                      filter(grepl(regex1,alias, ignore.case = TRUE)) %>%
+                      select(alias) %>%
+                      unlist() %>%
+                      str_split(string = .,pattern = " ") 
+  
+  gene2_aliases <- gene_aliases %>% 
+                      filter(grepl(regex2, alias, ignore.case = TRUE)) %>%
+                      select(alias) %>%
+                      unlist() %>%
+                      str_split(string = .,pattern = " ") 
+                      
+  
+  #If any of the alias are a longer that 1 charater string, then discard the alias and use the given gene
+  #I cannot disambiguate the true alias without checking the chromosomal start and end genomic loci for each option. That will be too time consuming at this point. 
+  #Also, some genes are not in this gene alias reference, like AC004791.2. 
+  if (length(gene1_aliases) > 1  | length(gene1_aliases) < 1 ){
+    gene1_aliases <- gene1
+  }
+  
+  if(length(gene2_aliases) > 1 | length(gene2_aliases) < 1){
+    gene2_aliases <- gene2
+  }
+  
+  # Uses expand.grid() to create a dataframe with every combination possible of the aliases for fusion gene 1 and fusion gene 2
+  gene1_aliases <- gene1_aliases[[1]] %>% .[.!=""]
+  gene2_aliases <- gene2_aliases[[1]] %>% .[.!=""]
+  alias_combos <- expand.grid(x=gene1_aliases, y=gene2_aliases) %>%
+    unique(., na.rm = TRUE) 
+  
+  # Pastes all the combos back together into Gene1_Gene2 format
+  alias_fusions <- paste(alias_combos$x, alias_combos$y, sep = sep)
+ 
+  return(alias_fusions)
+  
+}
+```
+
+
+#Read in the Clinical Data
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_12.09.20.csv"))
+
+merged <- merged %>% 
+  filter(!is.na(USI), USI != "Unknown")
+
+head(merged[,1:5])
+dim(merged) #2314  141
+```
+
+
+```{r}
+pt_IDs <- read.csv(file.path(TARGET,"SequencingDataMatrix/00_archive/TARGET_AML_RBD_0531_1031_miRNAseq_mRNAseq_Manifest_v5.csv")) %>% 
+  filter(mRNAseq_coverage.transcript.normalized==1) %>% #select patients with RBD sequencince only
+  select(matches("Patient|Replicate")) %>% 
+  #Add Stella
+  add_row(Final_Patient_ID="S.1327",PATIENT_ID_Original="S.1327",Replicate="none") %>% 
+  mutate_all(~gsub("-|\\+", "\\.", .)) %>% 
+  unique(.) %>% #removes the two identical entries for PATGIG and PATISD
+  mutate_at(vars(Final_Patient_ID), ~case_when(
+      Replicate == "Replicate" ~ paste0(Final_Patient_ID, "_replicate"),
+      TRUE ~ . )) %>% 
+  filter(!grepl("TARGET.20.PATGIG.03A.01R$|TARGET.20.PATISD.09A.01R$", Final_Patient_ID))
+
+  
+dim(pt_IDs) #1574    2 
+# table(pt_IDs$Replicate, useNA='ifany')
+# table(pt_IDs$Final_Patient_ID %in% manifest$Sample)
+# table(pt_IDs$PATIENT_ID_Original %in% manifest$Sample)
+```
+
+```{r}
+manifest.RBD <- read.csv(file.path(TARGET,"SequencingDataMatrix/00_archive/TARGET_AML_Ribodepleted_Master_Manifest_5.29.20.csv")) %>% 
+  select(Reg.,Sample:Time_point,Tissue,Protocol) %>% 
+  filter(Batch != "ds1") %>% #down-syndrome not included here yet
+  add_row(Sample="S.1327") %>% #Stella 
+  #Fix Stella
+  mutate_at(vars(USI), ~case_when(
+    is.na(.) ~ Sample,
+    TRUE ~.)) %>%
+  mutate_at(vars(Group), ~case_when(
+    is.na(.) & Sample == "S.1327" ~ "AML",
+    TRUE ~.)) %>%
+   mutate_at(vars(Time_point), ~case_when(
+    is.na(.) & Sample == "S.1327" ~ "relapse",
+    TRUE ~.)) %>%
+  mutate_at(vars(Protocol, Batch), ~case_when(
+    is.na(.)  ~ "Unknown",
+    TRUE ~.)) %>%
+  left_join(., pt_IDs, by=c("Sample"="Final_Patient_ID")) %>% 
+  
+  #Clean up any patients who are from later batches of RNA-seq. So basically relapse batch and DS batch. 
+  mutate(Lib_Prep="RBD") %>% 
+  mutate_at(vars(PATIENT_ID_Original), ~ifelse(is.na(.), Sample, .))
+
+
+# head(manifest.RBD[,1:5])
+dim(manifest.RBD) #2118  157
+# table(manifest.RBD$AML_Subtype)
+# table(manifest.RBD$Batch, useNA='ifany') #this inlcude the batch1, batch2, and relapse batch of RBD RNA-seq. 
+```
+
+
+# Clean up the Discovery Fusion Data and Merge Manifests
+
+```{r}
+discovery <- read.csv("TransAbyss_DiscoverySet/TARGET_AML_0531_DiscoverySet_TransAbyss_Fusions_reformatted_FilteredForNBM_PrimaryFusions_01.13.21.csv", row.names = 1) %>% 
+  mutate(PATIENT_ID_Original=Patient,
+         Patient=gsub("-", "\\.", Patient)) %>% 
+  mutate_at(vars(Patient), ~ifelse(. %in% manifest.RBD$Sample, paste0(.,"_replicate"), .)) %>% 
+  mutate_at(vars(Patient), ~ifelse(. %in% manifest.RBD$Sample, paste0(.,"2"), .)) %>% 
+  
+  #This data is older so it was using the MLL gene symbol. Now all newer refs use KMT2A
+  mutate_if(is.character,~gsub("^MLL$", "KMT2A", .)) %>% 
+  mutate_if(is.character,~gsub("^MLL(-.+)", "KMT2A\\1", gsub("^(.+-)MLL$", "\\1KMT2A", .)))
+
+
+# head(discovery)
+# table(unique(discovery$Patient) %in% manifest.RBD$Sample) #47 TRUE so renamed with replicate
+# filter(discovery, grepl("KMT2A", Fusion.Category))
+```
+
+```{r}
+discovery.manifest <- read.delim("Fusion_Reference/TARGET_AML_mRNA-seq_20170228.sdrf.txt", sep="\t") %>% 
+  filter(grepl(".fusion.vcf", Derived.Array.Data.File.1)) %>% 
+  filter(grepl("TARGET-20-", Extract.Name)) %>%
+  select(Patient=Extract.Name,
+         Tissue=Characteristics.OrganismPart.,
+         Library=Comment.LIBRARY_NAME.) %>% 
+  distinct() %>% 
+  filter(Patient %in% discovery$PATIENT_ID_Original) %>% 
+  mutate(USI=str_split_fixed(Patient, pattern = "-", n=5)[,3],
+         Sample=gsub("-","\\.", Patient),
+         PATIENT_ID_Original=Patient,
+         Lib_Prep="polyA",
+         Batch="dsc", 
+         Group="AML",
+         Time_point=ifelse(grepl("04A|40A",Patient), "relapse", "diagnostic")) %>% 
+  left_join(., select(merged, USI, Protocol), by="USI") %>% 
+  arrange(Patient) %>% 
+  mutate_at(vars(Sample), ~ifelse(. %in% manifest.RBD$Sample, paste0(.,"_replicate"), .)) %>% 
+  mutate_at(vars(Sample), ~ifelse(. %in% manifest.RBD$Sample, paste0(.,"2"), .))
+
+head(discovery.manifest)
+dim(discovery.manifest) #201   9
+# table(duplicated(discovery.manifest$Sample))
+# View(discovery.manifest)
+
+
+# table(discovery.manifest$Sample %in% manifest$Sample) #47 are in RBD dataset
+# table(discovery.manifest$Patient %in% discovery$PATIENT_ID_Original) 
+
+#201 are in the manifest file. while and addition 102 are not in our fusion.vcf dataset... odd. 
+```
+
+```{r}
+manifest <- manifest.RBD %>% 
+  bind_rows(., discovery.manifest) %>% 
+  left_join(., select(merged, USI, P2=Protocol), 
+            by="USI") %>% 
+  mutate_at(vars(Protocol), ~case_when(
+    .=="Unknown" & Group != "AML" ~ Group,
+    .=="Unknown" & Group == "AML" ~ P2,
+    TRUE ~ .)) %>% 
+  select(-P2)
+
+  
+
+
+dim(manifest)
+table(manifest$Batch)
+table(manifest$Lib_Prep)
+table(manifest$Protocol)
+
+# write.csv(manifest,"TARGET_AML_0531_1031_Relapse_Discovery_Sample_Manifest.csv", row.names = F)
+```
+
+
+# Read in the Fusion Data 
+
+There were 3 batches of RNAseq A) ~1117 mostly 1031 and B) 457 from 0531,MNP, and flow sorted samples, and C) relapse and matched diagnostic samples if not already sequenced.
+
+Then the naming convention was changed between the two batches and thus BAM files were harmonized for naming. 
+However, Karens data and STAR all used the original naming system and must be updated with newest IDs, which is used by TransAbyss
+
+
+```{r}
+TransAbyss <- 
+  #batch 1
+  read.csv("Cleaned_Filtered_Fusion_Calls/TARGET_AML_1031_TransAbyss_Fusions_reformatted_FilteredForNBM_PrimaryFusions_06.05.18.csv") %>%
+  mutate_at(vars(Patient), ~gsub("-|\\+","\\.",.)) %>%
+  left_join(., select(pt_IDs,
+                      PATIENT_ID_Original, Final_Patient_ID), #additional sample identifiers
+             by=c("Patient"="PATIENT_ID_Original")) %>%
+  mutate(PATIENT_ID_Original=Patient) %>%
+  mutate_at(vars(Patient),
+            ~ifelse(grepl("PATGIG|PATISD", .), gsub("_replicate","",.), .)) %>%
+
+  #batch 2
+  bind_rows(.,
+            read.csv("Cleaned_Filtered_Fusion_Calls/TARGET_AML_0531_TransAbyss_Fusions_reformatted_FilteredForNBM_PrimaryFusions_4.09.19.csv")) %>%
+  select(-Library, -Reg.) %>%
+  mutate_at(vars(matches("Patient")), ~gsub("-|\\+","\\.",.)) %>%
+
+  # Use most up to date naming convention
+  mutate(Final_Patient_ID=ifelse(grepl("_replicate", Patient),
+                                 paste0(Final_Patient_ID,"_replicate"),  Final_Patient_ID)) %>%
+  mutate(Patient=Final_Patient_ID) %>%
+  select(-Final_Patient_ID, -Age.at.Diagnosis.in.Days,
+         -Age.Yrs,-ISCN,-sum.break.reads) %>%
+  
+  #batch 3
+  bind_rows(., read.csv("Cleaned_Filtered_Fusion_Calls/TARGET_AML_0531_1031_Relapse_TransAbyss_Fusions_reformatted_FilteredForNBM_PrimaryFusions_10.30.19.csv")) %>%
+  mutate_at(vars(Patient), ~gsub("-|\\+","\\.",.)) %>%
+
+  # Discovery PolyA RNA-seq
+  bind_rows(., discovery) %>%
+
+  #Clean up the fusion category column
+  mutate_at(vars(Fusion.Category), ~case_when(
+    Fusion.Category == ""  ~ Fusion,
+    grepl("NonePassedFilter-NonePassedFilter", .) ~ "NonePassedFilter",
+    TRUE ~ .)) %>%
+  arrange(Patient)  %>%
+  as.data.frame()
+
+
+head(TransAbyss)
+dim(TransAbyss) # 24244    43
+length(unique(TransAbyss$Patient)) #2313
+# table(unique(TransAbyss$Patient) %in% manifest$Sample)
+# write.csv(TransAbyss,"TARGET_AML_RBD_0531_1031_Relapse_PolyA_DiscoverySet_TransAbyss_01.13.20.csv", row.names = F)
+
+```
+
+
+```{r}
+STAR <- 
+  #Batch 1
+  read.csv("Cleaned_Filtered_Fusion_Calls/TARGET_AML_1031_STAR_Fusion_reformatted_FilteredForNBM_PrimaryFusions_7.02.2018.csv", row.names = 1) %>%
+
+  #Batch 2
+  bind_rows(.,read.csv("Cleaned_Filtered_Fusion_Calls/TARGET_AML_0531_STAR_Fusion_reformatted_FilteredForNBM_PrimaryFusions_4.09.2019.csv")) %>%
+  select(-Final_Patient_ID) %>%  # a repeated column name. remove to avoid confusion.
+  mutate_at(vars(Patient), 
+            ~gsub("-|\\+","\\.",.)) %>% #clean up dashes, and CD34+ plus symbols
+  left_join(., pt_IDs,
+             by=c("Patient"="PATIENT_ID_Original")) %>%
+  mutate(Patient=Final_Patient_ID) %>%
+
+  #Batch 3
+  bind_rows(.,
+            read.csv("Cleaned_Filtered_Fusion_Calls/TARGET_AML_0531_1031_Relapse_STAR_Fusion_reformatted_FilteredForNBM_PrimaryFusions_5.01.2020.csv") %>% 
+  mutate_at(vars(Patient), ~ifelse(
+      grepl("PATGTL.03A|PAXWMS.03A|PASMSZ.03A",.), paste0(., "_replicate"), .))) %>%
+
+
+  #Clean up the fusions/category column
+  rowwise() %>%
+  mutate_at(vars(X.Fusion),
+            ~case_when(
+              grepl("\\-{2}",.) ~ gsub("\\-{2}","__", .),
+                       TRUE ~ .)) %>%
+  ungroup() %>%
+
+  add_row(Patient=setdiff(TransAbyss$Patient, .$Patient)) %>%
+  
+  select(-Age.Yrs, -ISCN, -Time_point,
+         -Final_Patient_ID, -Replicate,
+         -LIBRARY.mRNA) %>%
+  arrange(Patient) %>%
+  as.data.frame() #ensure class levels are same for all objects
+
+
+
+# head(STAR)
+dim(STAR) #100708     47
+length(unique(STAR$Patient)) #2107 in STAR alone (2313 when adding in the TransAbyss patients too)
+# table(unique(STAR$Patient) %in% manifest$Sample) #OK all in the manifest
+# setdiff(unique(TransAbyss$Patient), unique(STAR$Patient)) #5 missing data from Batch 1 RNA-seq
+
+# write.csv(STAR,"TARGET_AML_RBD_0531_1031_Relapse_01.13.20.csv", row.names = F)
+```
+
+```{r}
+CICERO <- read.csv("Cleaned_Filtered_Fusion_Calls/TARGET_AML_0531_1031_Relapse_CICERO_reformatted_FilteredForNBM_PrimaryFusions_6.12.20.csv") %>%
+  add_row(Patient=setdiff(TransAbyss$Patient, .$Patient)) %>%
+  select(-Age.in.years, -ISCN,
+         -Protocol) %>%
+  arrange(Patient)
+
+
+dim(CICERO) #75110    55
+length(unique(CICERO$Patient)) #2313
+length(unique(CICERO$Sample.s.)) #1374
+table(unique(CICERO$Patient) %in% manifest$Sample) #All OK
+# table(is.na(CICERO$Patient)) #67
+```
+
+
+```{r}
+TargetAlign <- read.csv("Cleaned_Filtered_Fusion_Calls/TARGET_AML_1031_Fusions_Formatted_FilteredForNBM_Primary_9.14.18.csv") %>%
+  filter(!grepl("^Kas|^MV4", USI)) %>%  #remove the cell lines
+  select(PATIENT_ID_Original=PATIENT_ID,everything()) %>%
+
+  bind_rows(.,read.csv("Cleaned_Filtered_Fusion_Calls/TARGET_AML_0531_Fusions_Formatted_FilteredForNBM_Primary_4.08.19.csv") %>%
+              select(PATIENT_ID_Original, USI, probes=Event, everything(),
+                     -GSC.Library.ID,
+                     -Final_Patient_ID, #duplicate column name. 
+                     -Known.Fusion.detected.by.any.method)) %>%
+  mutate_at(vars(PATIENT_ID_Original), ~(gsub("-|\\+", "\\.", .))) %>% 
+  inner_join(., pt_IDs, 
+             by=c("PATIENT_ID_Original")) %>%
+  mutate(Patient=Final_Patient_ID) %>%
+  
+
+ #at least 6 read counts to be consistent with Karen Mungalls original analysis in batch 1
+  group_by(Patient) %>%
+  mutate(all.fail=sum(Hit.Count < 6) == n()) %>%
+  mutate_at(vars(Type:Fusion.Category, GeneA:FusionExons, FusionTranscript:Fusion.Detected.K_Mungall),
+            ~(ifelse(all.fail | is.na(all.fail) , "NonePassedFilter", .))) %>%
+  mutate_at(vars(Hit.Count,Size), ~(ifelse(all.fail | is.na(all.fail), NA, .))) %>%
+  mutate_at(vars(Fusion.Category), ~(ifelse(. == "NonePassedFilter", "", .))) %>%
+  ungroup() %>%
+
+  filter(Hit.Count >= 6 | FusionName == "NonePassedFilter") %>%
+  unique(.) %>% #remove duplicate rows for patients who have fusions that did not pass filter.
+
+  #Re-order the columns  
+  add_row(Patient=setdiff(TransAbyss$Patient, .$Patient)) %>% 
+  select(Patient, USI, everything(),
+         -Age.Yrs, -ISCN,-Reg., -all.fail,
+         -Final_Patient_ID,-Replicate,
+         -PATIENT_ID_Original) %>%
+  arrange(Patient) %>%
+  as.data.frame() #ensure class levels are same for al objects
+
+
+head(TargetAlign)
+dim(TargetAlign)  #1870   19
+length(unique(TargetAlign$Patient)) #1565 originally 
+table(unique(TargetAlign$Patient) %in% manifest$Sample)
+# intersect(colnames(TargetAlign), colnames(TransAbyss))
+```
+
+
+
+#Read in the Blacklist for Fusions
+
+```{r}
+blacklist <- read.delim(file.path(HOME, "0000.00.02_Reference_GeneInfo/blacklist.fusions.txt"))
+
+blacklist <- blacklist %>%
+  unite(GeneA.breakpoint, chrA, posA, sep=":", remove=FALSE) %>%
+  unite(GeneB.breakpoint, chrB, posB,sep=":", remove=FALSE ) %>%
+  mutate_at(vars(GeneA.breakpoint, GeneB.breakpoint), ~(gsub("chr","", .))) %>%
+  mutate(Breakpoint1=paste(GeneA.breakpoint,GeneB.breakpoint, sep="|")) %>%
+  mutate(Breakpoint2=paste(GeneB.breakpoint,GeneA.breakpoint, sep="|")) #for reciprocals. 
+
+head(blacklist)
+dim(blacklist) #7987   11
+```
+
+```{r}
+blacklist.fusionName <- blacklist %>%
+  filter(!grepl("^$", geneA), !grepl("^$",geneB), !is.na(geneB), !is.na(geneA))
+
+blacklist.fusionName <- apply(blacklist.fusionName, 1, fixCommas, col="geneA") %>%
+  bind_rows()
+
+blacklist.fusionName <- apply(blacklist.fusionName, 1, fixCommas, col="geneB") %>%
+  bind_rows() %>%
+  mutate(Fusion1=paste(geneA,geneB, sep="-")) %>%
+  mutate(Fusion2=paste(geneB,geneA, sep="-")) %>% #for reciprocals. 
+  unique(.)
+
+
+dim(blacklist.fusionName)
+head(blacklist.fusionName)
+```
+
+
+
+#Read in the Fusion Annotation Information
+
+```{r}
+gene_aliases <- read.csv(file.path(HOME, "0000.00.02_Reference_GeneInfo/Hs_GeneInfo.Symb.Alias.csv"), 
+                         header = TRUE, stringsAsFactors = FALSE)
+gene_aliases$alias <- toupper(gene_aliases$alias)
+head(gene_aliases)
+```
+
+```{r}
+cols <- c("GeneA","GeneB")
+
+
+# Note: had to use the Zap Gremlins feature of BBEdit to remove weird, non-Unicode characters that were present in the original file prior to reading into R
+db_fusionCancer <- read.delim(file.path(GENREFS,"FusionGeneDatabases/FusionCancer/fusion_table.txt"), 
+                              sep = "\t", header = TRUE)  
+colnames(db_fusionCancer)[c(2,10)] <- cols
+db_fusionCancer <- db_fusionCancer %>%
+  unite(Breakpoint1,Head_breakpoint_location,Tail_breakpoint_location, sep="|", remove = F) %>%
+  mutate_at(vars(Breakpoint1), ~(gsub("chr","", .)))
+
+
+
+
+db_mitelman <- read.delim(file.path(GENREFS, "/FusionGeneDatabases/Mitelman/mitelman_formatted_tidy.txt"))
+db_mitelman <- db_mitelman %>%
+  separate(Gene, cols,sep="\\/", remove=F,fill="right", extra="merge")
+
+
+
+
+db_ticdb <- read.delim(file.path(GENREFS, "FusionGeneDatabases/TICdb/allseqs_TICdb.txt")) # 
+colnames(db_ticdb)[1:2] <- cols
+
+
+
+# This already has a properly formatted Fusion_pair column, no need to make new columns
+db_chimerDB <- read.delim(file.path(GENREFS, "FusionGeneDatabases/ChimerDB/ChimerDB3.0_ChimerKB.txt"))
+db_chimerDB <- db_chimerDB %>%
+  separate(Fusion_pair, cols, sep="_", remove = FALSE, fill="right")
+
+
+
+
+# COSMIC uses a special translocation notation, requires some manipulation to extract the gene symbols for each fusion gene
+db_cosmic <- read.delim(file.path(GENREFS, "FusionGeneDatabases/COSMIC/CosmicFusionExport.tsv"))
+
+#Extracting the gene symbols for each gene involved in the fusion
+pattern1 <- "^([[:alnum:]])*(?=\\{)"
+pattern2 <- "(?<=_)([[:alnum:]])*(?=\\{)"
+db_cosmic$GeneA <- str_match(as.vector(db_cosmic$Translocation.Name), pattern1)[,1]
+db_cosmic$GeneB <- str_match(as.vector(db_cosmic$Translocation.Name), pattern2)[,1]
+
+
+
+db_tumorFusion <- read.delim(file.path(GENREFS,"FusionGeneDatabases/TCGA_TumorFusion/JacksonLab_TumorFusions.txt"))
+colnames(db_tumorFusion)[3:4] <- cols
+db_tumorFusion <- db_tumorFusion %>%
+  unite(GeneA.Breakpoint, A_chr, Junction_A,remove = F, sep=":") %>%
+  unite(GeneB.Breakpoint, B_chr, Junction_B,remove = F, sep=":") %>%
+  unite(Breakpoint1, GeneA.Breakpoint,GeneB.Breakpoint, remove = T, sep="|")
+```
+
+
+
+#Merge the data frames
+
+```{r}
+library(furrr)
+```
+
+```{r}
+Samples <- unique(TransAbyss$Patient)
+length(Samples)
+length(unique(STAR$Patient))
+length(unique(TargetAlign$Patient))
+length(unique(CICERO$Patient))
+
+
+all(Samples %in% unique(STAR$Patient))
+all(Samples %in% unique(TargetAlign$Patient))
+all(Samples %in% unique(CICERO$Patient))
+
+all(Samples %in% manifest$Sample)
+```
+
+```{r warning=FALSE, message=FALSE}
+tictoc::tic()
+future::plan("multisession")
+
+
+combined <- future_map_dfr(Samples, 
+                           .f=Combine_Fusion_Callers, 
+                            star=STAR, 
+                            ta=TransAbyss,
+                            cicero=CICERO,
+                            targAlign=TargetAlign, 
+                            .progress = TRUE,
+                            .options = future_options(scheduling = 2.0))
+
+tictoc::toc() #185.496 sec elapsed (377.709 sec elapsed??  on a differnt run... not sure multisession is working at all)
+
+```
+
+
+```{r}
+dim(combined) #184830    154
+head(combined)
+
+
+# write.csv(combined,
+#           file="Combined/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_FusionCalls_raw.csv",
+#           row.names = FALSE)
+
+```
+
+```{r}
+samps_out <- unique(unlist(list(combined$Patient.TA,combined$Patient.STAR, combined$Patient.CICERO)))
+length(samps_out) #one is an NA
+
+all(Samples %in% samps_out)
+length(unique(combined$Sample.s..CICERO)) #1373
+```
+ 
+
+
+
+#Clean up the merged dataframe
+
+```{r}
+splitStr <- function(string, pattern){
+    str <- unique(unlist(str_split(string, pattern = pattern))) %>% 
+      .[.!=""] 
+    
+
+    if(any(grepl("replicate", str))){
+      replicate <- unique(grep("replicate", str, value=T))
+      res <- paste(str[1],replicate, sep=pattern) #for those samples with replicate in ID
+    }else{
+      res <-  str[1]
+    }
+    
+
+    return(res)
+}
+```
+  
+```{r}
+idx <- which(apply(combined, 1, function(x) all(is.na(x))))
+length(idx) #2234 NAs for the entire row???
+# View(combined[idx,])
+# table(complete.cases(combined[idx,]))
+```
+ 
+
+```{r}
+combined.clean.first <- combined %>% 
+  
+  #remove unncessary columns and rows
+  select(-PATIENT_ID_Original.TA, -Sample.s..CICERO) %>% 
+  slice(-idx) %>%
+  
+  #Make the "Detected" columns uniform in thier factor levels. 
+  #must update these to note that CICERO was not run on the complete dataset!
+  rename_at(vars(matches("^Fusion.Detected")), 
+            ~gsub("([A-Z].+).STAR$", "\\1", .) %>% 
+              gsub("TransAbyss.|K_Mungall.", "", .)) %>%
+  mutate_at(vars(matches("Fusion.Detected")), 
+            ~ifelse(is.na(.) | grepl("None", .), "No", .)) %>%
+  mutate_at(vars(matches("Fusion.Detected")), 
+            ~gsub("Detected","Yes",.)) %>%
+  
+  #Create a column for all Fusions Called  and Combine the identifier columns and Type(inter/intra) to avoid re-doing. 
+  mutate_at(vars(matches("^Patient"),
+                 matches("^Type|^Fusion_Type", ignore.case = FALSE),
+                 matches("^Fusion.Category"),
+                 Fusion.TA, X.Fusion.STAR, 
+                 Fusion.Gene.CICERO, FusionName.TargAlign),
+            ~ifelse(is.na(.), "", .)) %>%
+  
+  unite("Patient", Patient.TA, Patient.STAR,
+        Patient.CICERO, Patient.TargAlign, 
+        remove = T) %>%
+  unite("Type", Type.TA, Type.STAR, Fusion_Type.CICERO,Type.TargAlign, 
+        remove = T) %>%
+  unite("All_Fusions_Called", Fusion.TA, X.Fusion.STAR,
+        Fusion.Category.CICERO, FusionName.TargAlign, 
+        sep="|", remove = F) %>%
+  unite("Fusion.Category", Fusion.Category.TA, Fusion.Category.STAR,
+        Fusion.Category.CICERO, Fusion.Category.TargAlign, 
+        sep="|", remove = F) %>%
+
+
+  # Clean up the duplicates in the united columns. Select the first entry for fusions because there are reciprocals, so unique returns vector > 1
+  rowwise() %>%
+  mutate_at(vars(Patient,Type),
+            ~(splitStr(., pattern = "_"))) %>% 
+  mutate_at(vars(All_Fusions_Called, Fusion.Category),
+            ~(splitStr(., pattern = "\\|"))) %>% 
+  ungroup() 
+
+
+table(combined.clean.first$Patient %in% manifest$Sample)
+dim(combined.clean.first)
+```
+```{r}
+
+filter(combined.clean, grepl("TARGET.20.PAEIKD.09A.01R", Patient)) %>% View()
+# filter(discovery, grepl("KMT2A", Fusion.Category)) #TARGET.20.PAEIKD.09A.01R
+```
+
+
+```{r}
+combined.clean <- combined.clean.first %>%
+  
+  # Merge in the Group and USI Column
+  left_join(., select(manifest, Sample,Protocol, Group,
+                      USI, Lib_Prep, Time_point,Batch, ISCN),
+            by=c("Patient"="Sample")) %>%
+  
+  #Merge in the CICERO IDs
+  left_join(., select(CICERO, Patient, SJ_ID=Sample.s.) %>%
+              filter(!is.na(SJ_ID)) %>%
+              unique(.),
+            by="Patient") %>%
+
+  #Denote patients that didnt have CICERO data available
+  mutate_at(vars(Fusion.Detected.CICERO), ~case_when(
+    is.na(SJ_ID) ~ "No Data",
+    TRUE ~ .)) %>%
+
+  # Remove unnessary columns
+  select(-matches("forward|reverse", ignore.case = FALSE),
+         -Fusion.Category.TA, -Fusion.Category.STAR,
+        -Fusion.Category.TargAlign) %>%
+
+  #order columns
+  select(USI, Patient,
+         SJ_ID,Lib_Prep,
+         Protocol, Group, Time_point,
+         Batch, ISCN, Type,
+
+         All_Fusions_Called,
+         Fusion.TA, X.Fusion.STAR,
+         Fusion.Category.CICERO, FusionName.TargAlign,
+
+         breakpoint.TA, Breakpoints.STAR, Breakpoint.CICERO,
+         Breakpoint.TargAlign,
+
+         Alternate.Breakpoints.TA, Alternate.Breakpoints.STAR,
+         Alternate.Breakpoints.CICERO,Alternate.Breakpoints.TargAlign,
+
+         spanning_reads.TA, breakpoint_pairs.TA, flanking_pairs.TA,
+         SpanningRead.STAR, JunctionRead.STAR,
+         NumReadsA.CICERO,NumReadsB.CICERO,
+         Hit.Count.TargAlign,
+
+         matches("frame"),
+         matches("Fusion.Detected"),
+         contains("size"),
+         Fusion.Category,
+         matches(".TA$"), matches(".STAR$"),
+         matches(".CICERO$"), matches(".TargAlign$"),
+         -GSC.library.TA,
+         -matches("Age.in.years")) %>%
+
+  arrange(Group)
+
+
+head(combined.clean)
+# View(combined.clean)
+```
+
+
+```{r}
+# suffix <- c(".CICERO",".TA",".STAR",".TargAlign")
+# sapply(combined.clean[,paste0("Fusion.Detected", suffix)], table, useNA='ifany')
+```
+
+```{r}
+sum(is.na(combined.clean$Patient))
+sum(combined.clean$Patient == "")
+
+sum(is.na(combined.clean$SJ_ID)) #42664
+
+length(unique(combined.clean$SJ_ID))  #1374 one is NA
+length(unique(combined.clean$Patient)) # 2313
+
+table(combined.clean$Batch, useNA = "ifany")
+table(combined.clean$Protocol, useNA = "ifany")
+table(combined.clean$Time_point, useNA = "ifany")
+
+table(combined.clean$Type)
+table(combined.clean$In_frame.TA)
+```
+
+```{r}
+dim(combined.clean) #182,596    149
+length(unique(combined.clean$All_Fusions_Called)) #58402
+length(unique(combined.clean$Fusion.Category)) #56579
+```
+
+```{r}
+# write.csv(combined.clean, "Combined/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_FusionCalls.csv", row.names = FALSE)
+
+# getwd()
+
+# View(select(combined.clean, Patient, All_Fusions_Called, Fusion.Category))
+```
+
+
+```{r}
+# View(select(combined.clean, Patient, SJ_ID, All_Fusions_Called, Fusion.Category))
+# filter(combined.clean, Patient=="TARGET.20.PAWIVB.09A.01R", grepl("BAZ2B",Fusion.Category)) %>% 
+#   View()
+```
+
+
+
+
+#Annotate for Black listed Fusions 
+
+```{r}
+# combined.clean <-  read.csv("TARGET_AML_0531_1031_")
+dim(combined.clean)
+```
+
+```{r}
+tictoc::tic()
+combined.clean.annot <- combined.clean %>%
+  #Fix small differences in notation to be consistent. 
+  mutate_at(vars(contains("Alternate")), ~ifelse(grepl("^$", .), NA, .)) %>%
+  mutate_at(vars(Breakpoint.TargAlign,
+                 Alternate.Breakpoints.TargAlign), ~gsub("-", "|", .)) %>%
+  
+  #Cannot use select(.,matches()) function with rowwse. it will select the WHOLE dataframe,not the grouped one???
+  #Annotate out fusions with any of the breakpoints falling into the blacklist.
+  rowwise() %>%
+  mutate(FailedBlacklist_byBreakpoint=blacklistFusions(c1 = breakpoint.TA,
+                                       c2 = Breakpoints.STAR,
+                                       c3 = Breakpoint.CICERO,
+                                       c4 = Alternate.Breakpoints.TA,
+                                       c5 = Alternate.Breakpoints.STAR,
+                                       c6 = Alternate.Breakpoints.CICERO,
+                                       df2.blacklist = blacklist, 
+                                       type = "Breakpoint")) %>%
+  
+  #Annotate the fusions based on the gene symbol to catch more.
+  mutate(FailedBlacklist_byFusionName=blacklistFusions(c1 = All_Fusions_Called,
+                                       c2 = NULL,
+                                       c3 = NULL,
+                                       c4 = NULL,
+                                       c5 = NULL,
+                                       c6 = NULL,
+                                       df2.blacklist = blacklist.fusionName,
+                                       type="Fusion")) %>%
+  ungroup() 
+
+
+tictoc::toc() #488.387 sec elapsed
+```
+
+```{r}
+dim(combined.clean.annot) # 182596    151
+head(combined.clean.annot)
+
+length(unique(combined.clean.annot$Patient))
+length(unique(combined.clean.annot$SJ_ID))
+```
+
+
+```{r}
+# write.csv(combined.clean.annot, "Combined/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_FusionCalls_AnnotatedBlacklist.csv")
+```
+
+I will not filter out the fusions currently. There is not enough support for picking a threshhold, like +/- 10bp on the breakpoints. 
+But using the whole gene names, you remove fusions of interest like PIM3-BRD1
+
+```{r}
+sum(!is.na(combined.clean.annot$FailedBlacklist_byBreakpoint))  #5588
+sum(!is.na(combined.clean.annot$FailedBlacklist_byFusionName)) #14932
+```
+
+
+# Annotate for the Fusion Data Bases (Whitelists)
+
+```{r}
+combined.clean.annot <- read.csv("Combined/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_FusionCalls_AnnotatedBlacklist.csv")
+
+dim(combined.clean.annot)
+```
+
+```{r}
+any(is.na(combined.clean.annot$Fusion.Category))
+any(combined.clean.annot$Fusion.Category=="")
+```
+
+```{r}
+dbs <- list(db_fusionCancer=db_fusionCancer,
+            db_mitelman=db_mitelman,
+            db_ticdb=db_ticdb,
+            db_cosmic=db_cosmic,
+            db_tumorFusion=db_tumorFusion)
+rm(list = ls(pattern = "db_"))
+```
+
+```{r}
+cols <- c("GeneA","GeneB")
+
+#Reformat the Dataframs for uppercase and remove special characters. 
+dbs <- lapply(dbs, function(x) mutate_at(.tbl = x, .vars = vars(cols), ~toupper(.)))
+dbs <- lapply(dbs, function(x) mutate_at(.tbl = x, .vars = vars(cols), ~(gsub("\\-|_|\\/|\\+", "\\.", .))))
+
+#Create new columns for the Fusions and the re-order the columns 
+dbs <- lapply(dbs, function(x) unite(data = x, col = "Fusion1", 
+                                     all_of(cols), sep = "-",remove = F))
+dbs <- lapply(dbs, function(x) unite(data = x, col = "Fusion2", 
+                                     all_of(rev(cols)), sep = "-",remove = F))
+dbs <- lapply(dbs, function(x) select(.data = x, Fusion1,Fusion2, 
+                                      GeneA, GeneB, everything()))
+
+
+sapply(dbs, dim)
+# sapply(dbs, head)
+# saveRDS(dbs,"Fusion_ReferenceFiles_10.8.18.RDS")
+```
+
+```{r}
+Names <- names(dbs)
+
+dbs_toMerge <- lapply(names(dbs), function(name) {
+  db <- str_split(name, pattern="_")[[1]][2]
+  col <- paste0("Present_in_", db, "_byFusionName")
+
+  dbs[[name]] %>%
+      rowwise() %>%
+      mutate(Fusion.Category=fusionCategory(GeneA,GeneB)) %>%
+      ungroup() %>%
+      mutate(!! col := "Yes") %>%
+      select(Fusion.Category,all_of(col)) %>% 
+      distinct()
+  }
+)
+
+names(dbs_toMerge) <- Names
+sapply(dbs_toMerge, dim)
+lapply(dbs_toMerge, head)
+```
+
+
+```{r}
+#No need to search through each patient-fusion combination, since we're only annotating by fusion gene symbols. 
+#so only annotate a single Fusion_Name in All_Fusions_Called to avoid running code uncessarily, as it is very slow. 
+input.df <- combined.clean.annot %>% 
+  select(Fusion.Category) %>% 
+  unique()
+
+dim(input.df) #56579     1
+```
+
+```{r}
+#Will need to account for gene aliases at some point, though proportionally it added only maybe 1-2% more hits. 
+combined.clean.annotdb <- combined.clean.annot %>% 
+  left_join(.,dbs_toMerge$db_fusionCancer, by="Fusion.Category") 
+
+combined.clean.annotdb <- combined.clean.annotdb %>% 
+  left_join(.,dbs_toMerge$db_mitelman, by="Fusion.Category")
+  
+combined.clean.annotdb <- combined.clean.annotdb %>% 
+  left_join(.,dbs_toMerge$db_ticdb, by="Fusion.Category")
+
+
+combined.clean.annotdb <- combined.clean.annotdb %>% 
+  left_join(.,dbs_toMerge$db_cosmic, by="Fusion.Category") 
+
+
+combined.clean.annotdb <- combined.clean.annotdb %>% 
+  left_join(.,dbs_toMerge$db_tumorFusion, by="Fusion.Category")
+
+
+dim(combined.clean.annotdb) #182596    157
+length(unique(combined.clean.annotdb$Patient)) #2313
+length(unique(combined.clean.annotdb$SJ_ID)) #1374
+
+# head(combined.clean.annotdb)
+```
+
+
+```{r eval=FALSE}
+
+library(furrr)
+library(purrr)
+library(tictoc)
+
+future::plan("multisession")
+
+#this simply doesnt work any more. for 56K fusions its just intractable. It causes crashes and could take up to 33 hrs to simply annotate gene fusons with lapply...
+tic()
+colNames <- c("Present_inFusionCancer_byFusionName",
+              "Present_inMitelman_byFusionName",
+              "Present_inTicdb_byFusionName",
+              "Present_inCOSMIC_byFusionName", 
+              "Present_inTumorFusion_byFusionName",
+              
+              "CancerType_inFusionCancer_byFusionName",
+              
+              "Morphology_inMitelman_byFusionName",
+              "FAB_inMitelman_byFusionName", 
+              "CancerType_inCOSMIC_byFusionName", 
+              "CancerType_inTumorFusion_byFusionName")
+
+secondCols=c("Cancer_type", "Morphology", "FAB_Type", 
+             "Primary.histology", "Cancer")
+
+db_fusion_annots <- input.df
+i=1
+for (col in colNames){
+  
+    col2="Breakpoint1"
+    if(grepl("CancerType|Morphology|FAB", col)){
+      col2=secondCols[i-5]
+    }
+    
+     print(c(col, col2,i))
+     
+    toQuery <- str_split_fixed(col,pattern="_in|_", n=3)[,2]
+    dbName <- grep(toQuery, names(dbs), value=T, ignore.case = T)
+    print(dbName)
+    
+    db_fus_annot_temp <- future_map_dfr(1:10, function(n,input.df){
+
+      input.df %>%
+        select(Fusion.Category) %>%
+        slice(n) %>%  #select a range of rows.
+        mutate(!! col := AnnotFusions(c1 = Fusion.Category,
+                                   df2.annot = dbs[[dbName]],
+                                   alias.df = gene_aliases,
+                                   col2=col2))
+       
+      
+    }) %>% 
+    bind_rows() #future_map_dfr(1:nrow(input.df), function(i,input.df)
+  
+  i=i+1
+  # db_fusion_annots <- inner_join(db_fusion_annots, db_fus_annot_temp, by="Fusion.Category")
+
+}
+
+toc() #1389.674 sec elapsed... so that took 23 minutes... ugh that could be improved. 
+```
+
+
+
+#Add additional Cytogenetic Information
+
+```{r}
+combined.clean.annotdb <- read.csv("Combined/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_FusionCalls_Annotated.csv")
+
+
+dim(combined.clean.annotdb)
+```
+
+```{r warning=FALSE}
+combined.clean.update <- combined.clean.annotdb %>%
+  select(-c(ISCN:Primary.Cytogenetic.Code)) %>%  #needs updating 
+  left_join(., select(merged, USI, ISCN, Age.in.years, FLT3.ITD.positive.,
+                      NPM.mutation., CEBPA.mutation., Primary.Cytogenetic.Code), 
+            by=c("USI"="USI")) %>%
+
+  select(USI:SJ_ID,
+         ISCN,
+         Age.in.years,FLT3.ITD.positive.,
+         NPM.mutation., CEBPA.mutation.,
+         Primary.Cytogenetic.Code,
+         Lib_Prep:Batch, 
+         Type:frame.CICERO,
+         matches("size"),
+         matches("byFusionName|FailedBlacklist"),
+         matches("Fusion.Detected"),
+         everything(),
+         # -sv_frame_index.CICERO, 
+         -matches("In.Frame.CDS")) %>%
+         # -matches("^repeat|^qpos|^CDS|Reciprocal|Orient|Entropy|PFAM|SpliceTyp
+         #          |^ratio|FAR|Source|LocalBreakpoint|Strand")) %>%
+  mutate_at(vars(1:8), ~ifelse(grepl("^$", .), NA, .)) %>% 
+  arrange(Protocol,Group)
+
+
+head(combined.clean.update)
+dim(combined.clean.update) #182596    159
+```
+
+```{r}
+# write.csv(combined.clean.update,"Combined/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_FusionCalls_Annotated.csv", row.names = FALSE)
+```
+
+
+
+#Split into Inter and Intra chromosomal Fusions
+
+```{r}
+combined.clean.update <- read.csv("Combined/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_FusionCalls_Annotated.csv")
+
+
+dim(combin)
+```
+
+
+```{r}
+intra <- combined.clean.update %>%
+    filter(grepl("intrachromosomal|NoneDetected|NonePassedFilter", Type)) 
+
+dim(intra) # 110,348    161
+
+# write.csv(intra, "Combined/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_intrachromosomal_FusionCalls_Annotated.csv", row.names = FALSE)
+```
+
+
+```{r}
+inter <- combined.clean.update %>%
+    filter(grepl("interchromosomal|NoneDetected|NonePassedFilter", Type)) 
+
+dim(inter) #68,425   161
+
+# write.csv(inter,  "Combined/TARGET_AML_0531_1031_Relapse_Discovery_Combined_STAR_TransAbyss_CICERO_interchromosomal_FusionCalls_Annotated.csv", row.names = FALSE)
+```
+
+
+#Check out for Fusions of Interest 
+
+1. Monosomy 7 with MECOM/ALK fusions 
+2. RUNX1-ETV6
+3. MLLT10-X fusions
+
+```{r}
+dim(combined.clean.annot) #178667    150
+```
+
+## Monosomy 7 
+
+```{r}
+gene_aliases %>% 
+  filter(grepl("MECOM", alias))
+```
+
+```{r}
+mono7.manifest <- filter(manifest, Primary.Fusion.CNV == "monosomy7") %>% 
+               select(Sample, Primary.Fusion.CNV, Additional.Fusions.CNV, Group)
+   
+dim(mono7.manifest)
+# View(mono7.manifest)
+table(mono7.manifest$Sample %in% combined.clean.annot$Patient)
+```
+
+```{r}
+mono7 <- combined.clean.annot %>% 
+  inner_join(., mono7.manifest, by=c("Patient"="Sample")) %>% 
+  select(1:8, Primary.Fusion.CNV, Additional.Fusions.CNV, everything()) %>%
+  filter(grepl("MECOM|EVI1|KMT8E|MDS1", All_Fusions_Called)) %>% 
+  filter(!grepl("PRDM16", All_Fusions_Called)) %>% 
+  select(1:37)
+
+
+dim(mono7)  
+View(mono7)
+
+# mono7$annots.STAR
+# any(!is.na(mono7$FailedBlacklist_byBreakpoint))
+# any(!is.na(mono7$FailedBlacklist_byFusionName))
+# write.csv(mono7,"TARGET_AML_Monosomy7_MECOM_RNA-seq_FusionCalls.csv", row.names = F)
+```
+
+```{r}
+# sapply(CICERO, function(x) grep("read", x, ignore.case=T))
+# mono7$Type.CICERO
+# table(combined.clean.annot$Type.CICERO)
+```
+
+```{r}
+# lapply(dbs, head)
+ALK_fusions.dbs <- lapply(dbs, function(x) 
+  filter(x, grepl("^ALK-|-ALK$", Fusion1) | grepl("^ALK-|-ALK$", Fusion2)))
+
+
+sapply(ALK_fusions.dbs, dim)
+# saveRDS(ALK_fusions.dbs,"Fusions_Of_Interest/ALK_Fusions_in_Databases.RDS")
+```
+
+```{r}
+View(ALK_fusions.dbs$db_mitelman)
+```
+
+
+## RUNX1-ETV6 
+
+```{r}
+gene_aliases %>% 
+  filter(grepl("RUNX1$|ETV6", Symbol))
+```
+
+```{r}
+regex <- c(alias_converter(fusion = "RUNX1-ETV6"), alias_converter(fusion = "ETV6-RUNX1")) %>% 
+  grep("\\/",., value=T, invert = T) %>% 
+  paste(., collapse = "|")
+
+regex
+```
+
+```{r}
+runx1.etv6 <- combined.clean.annot %>% 
+  filter(grepl(regex, All_Fusions_Called) | 
+           grepl("RUNX1-ETV6|ETV6-RUNX1", All_Fusions_Called))
+
+
+runx1.etv6
+```
+
+## MLLT10 
+
+```{r}
+gene_aliases %>% 
+  filter(grepl("MLLT10$", Symbol))
+```
+
+
+^((?!hede).)*$
+
+```{r}
+example <- c("KMT2A-MLLT10", "MLLT10-AMICA1")
+
+
+a <- sum(grepl("KMT2A-MLLT10|MLLT10-KMT2A", example)) 
+b <- sum(!grepl("KMT2A", example))
+
+a+b
+# grepl("^((?!hede).)*$", example, perl = TRUE)
+# grepl("^((?!KMT2A))", example, perl = TRUE) #negative look ahead
+
+```
+
+```{r}
+mllt10 <- combined.clean.annot %>% 
+  filter(grepl("MLLT10-|-MLLT10|-AF10|AF10-", All_Fusions_Called)) %>% 
+  
+  group_by(Patient) %>%
+  mutate(N_MLLT10_Fusions_Per_Patient=n(),
+         KMT2A_MLLT10_Category=case_when(
+            n() <= 2 & 
+            sum(grepl("KMT2A-MLLT10|MLLT10-KMT2A", All_Fusions_Called)) == n() ~ "KMT2A_fusion_only", 
+           
+            n() <= 2 & 
+            sum(!grepl("KMT2A", All_Fusions_Called)) == n() ~ "MLLT10_fusion_only",
+           
+            n() == 2 & 
+            sum(grepl("KMT2A-MLLT10|MLLT10-KMT2A", All_Fusions_Called)) == 1 &
+            sum(!grepl("KMT2A", All_Fusions_Called)) == 1 ~  "3way_MLLT10_fusion", 
+           
+           n() > 2 & 
+            sum(grepl("KMT2A-MLLT10|MLLT10-KMT2A", All_Fusions_Called)) == 0 &  
+            sum(!grepl("KMT2A", All_Fusions_Called)) >= 2 ~ "MLLT10_fusion_only", 
+           
+           n() > 2 & 
+            sum(grepl("KMT2A-MLLT10|MLLT10-KMT2A", All_Fusions_Called)) == 1 &  
+            sum(!grepl("KMT2A", All_Fusions_Called)) >= 2 ~ "3way_MLLT10_fusion", 
+     
+           TRUE ~ "WHAT" ))  %>%
+  select(1:3,N_MLLT10_Fusions_Per_Patient,KMT2A_MLLT10_Category, everything()) %>%
+  select(1:40) %>% 
+  ungroup()
+
+
+
+dim(mllt10) #378 149
+length(unique(mllt10$Patient))
+# write.csv(mllt10, "TARGET_AML_MLLT10_RNA-seq_FusionCalls.csv", row.names = FALSE)
+```
+
+```{r}
+# View(mllt10)
+
+# filter(mllt10, N_MLLT10_Fusions_Per_Patient > 2) %>% 
+#   select(1:3,N_MLLT10_Fusions_Per_Patient,KMT2A_MLLT10_Category, everything()) %>%
+#   View()
+```
+
+```{r}
+table(mllt10$N_MLLT10_Fusions_Per_Patient)
+table(mllt10$KMT2A_MLLT10_Category)
+```
+
+```{r}
+t <- select(mllt10, Patient, KMT2A_MLLT10_Category) %>% 
+  unique() %>% 
+  group_by(KMT2A_MLLT10_Category) %>%
+  summarize(N=n()) %>%
+  ungroup()
+
+t
+
+# any(duplicated(t$Patient))
+```
+
+
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+
+
+
+#Old Code
+
+```{r eval=FALSE}
+  db_fusion_annots <- future_map_dfr(1:nrow(input.df), function(i,input.df){
+      input.df %>%
+      select(Fusion.Category) %>% 
+      slice(i) %>%  #select a range of rows.
+      mutate(Present_inFusionCancer_byFusionName=AnnotFusions(c1 = Fusion.Category,
+                                                            df2.annot = dbs$db_fusionCancer,
+                                                            alias.df = gene_aliases)) %>%
+      mutate(Present_inMitelman_byFusionName=AnnotFusions(c1 = Fusion.Category,
+                                                        df2.annot = dbs$db_mitelman,
+                                                        alias.df = gene_aliases)) %>%
+    
+      mutate(Present_inTicdb_byFusionName=AnnotFusions(c1 = Fusion.Category,
+                                                     df2.annot = dbs$db_ticdb,
+                                                     alias.df = gene_aliases)) %>%
+    
+      mutate(Present_inCOSMIC_byFusionName=AnnotFusions(c1 = Fusion.Category,
+                                                      df2.annot = dbs$db_cosmic,
+                                                      alias.df = gene_aliases)) %>%
+    
+      mutate(Present_inTumorFusion_byFusionName=AnnotFusions(c1 = Fusion.Category,
+                                                           df2.annot = dbs$db_tumorFusion,
+                                                           alias.df = gene_aliases)) %>%
+    
+      #Other Annotation Columns
+      mutate(CancerType_inFusionCancer_byFusionName=AnnotFusions(c1 = Fusion.Category,
+                                                               df2.annot = dbs$db_fusionCancer,
+                                                               alias.df = gene_aliases,
+                                                               col2 = "Cancer_type")) %>%
+    
+      mutate(Morphology_inMitelman_byFusionName=AnnotFusions(c1 = Fusion.Category,
+                                                           df2.annot = dbs$db_mitelman,
+                                                           alias.df = gene_aliases,
+                                                           col2="Morphology")) %>%
+    
+      mutate(FAB_inMitelman_byFusionName=AnnotFusions(c1 = Fusion.Category,
+                                                    df2.annot = dbs$db_mitelman,
+                                                    alias.df = gene_aliases,
+                                                    col2="FAB_Type")) %>%
+    
+      mutate(CancerType_inCOSMIC_byFusionName=AnnotFusions(c1 = Fusion.Category,
+                                                         df2.annot = dbs$db_cosmic,
+                                                         alias.df = gene_aliases,
+                                                         col2="Primary.histology")) %>%
+    
+      mutate(CancerType_inTumorFusion_byFusionName=AnnotFusions(c1 = Fusion.Category,
+                                                              df2.annot = dbs$db_tumorFusion,
+                                                              alias.df = gene_aliases,
+                                                              col2="Cancer")) 
+  }, input.df=input.df, .progress = TRUE)
+```
+
